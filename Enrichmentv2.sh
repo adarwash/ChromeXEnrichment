@@ -214,6 +214,15 @@ logger = logging.getLogger(__name__)
 
 # Get Model Name from Environment (set by installer)
 AI_MODEL = os.getenv("AI_MODEL_NAME", "llama3.2:1b")
+# Task-specific local models. Default to AI_MODEL when not overridden so the
+# system works out of the box, but operators can point each specialist task at
+# a smaller/faster model (e.g. AI_MODEL_MATCHER=llama3.2:1b for entity match,
+# AI_MODEL_SUMMARIZER=llama3.1:8b for narrative output).
+AI_MODEL_MATCHER = os.getenv("AI_MODEL_MATCHER", AI_MODEL)        # entity / name matching
+AI_MODEL_VALIDATOR = os.getenv("AI_MODEL_VALIDATOR", AI_MODEL)    # website-to-company validation
+AI_MODEL_ADDRESS = os.getenv("AI_MODEL_ADDRESS", AI_MODEL)        # address comparison / verification
+AI_MODEL_CLASSIFIER = os.getenv("AI_MODEL_CLASSIFIER", AI_MODEL)  # industry / sector classification
+AI_MODEL_SUMMARIZER = os.getenv("AI_MODEL_SUMMARIZER", AI_MODEL)  # final business activity summary
 COMPANIES_HOUSE_API_KEY = os.getenv("COMPANIES_HOUSE_API_KEY", "").strip()
 
 app = FastAPI(
@@ -230,7 +239,7 @@ Features:
 - **Overall summary** — cross-referenced B2B profile with Companies House priority, verified phones, domains_scanned
 - **Parallel processing** — concurrent AI inference, Companies House lookups, and page crawling
 """,
-    version="2.5.0"
+    version="2.6.0"
 )
 
 # --- Pydantic Models ---
@@ -672,10 +681,12 @@ def build_overall_b2b_summary(query: str, location: Optional[str], results: List
     # Rank address candidates by source trust before length.
     # non-aggregator website > trusted Companies House/aggregator AI.
     address_candidates: List[Dict[str, Any]] = []
+    companies_house_address_candidates: List[str] = []
     for item in (trusted_companies_house_hits or companies_house_hits):
         ch = item.get("companies_house") or {}
         formatted = format_registered_office_address(ch.get("registered_office_address"))
         if formatted:
+            companies_house_address_candidates.append(formatted)
             address_candidates.append({"address": formatted, "priority": 4})
     for item in successful_sorted:
         enr = item.get("enrichment") or {}
@@ -783,6 +794,23 @@ def build_overall_b2b_summary(query: str, location: Optional[str], results: List
                 directors_input.extend(enr.get("directors") or [])
     directors = unique_directors(directors_input)
 
+    verified_address = None
+    verified_address_fields = None
+    if address and companies_house_address_candidates:
+        selected_fields = parse_address_fields(address, location)
+        selected_postcode = (selected_fields.get("postcode") or "").strip().upper()
+        selected_line1 = slugify_text(selected_fields.get("line1") or "")
+        for candidate in companies_house_address_candidates:
+            candidate_fields = parse_address_fields(candidate, location)
+            candidate_postcode = (candidate_fields.get("postcode") or "").strip().upper()
+            candidate_line1 = slugify_text(candidate_fields.get("line1") or "")
+            same_postcode = bool(selected_postcode and candidate_postcode and selected_postcode == candidate_postcode)
+            same_line1 = bool(selected_line1 and candidate_line1 and selected_line1 == candidate_line1)
+            if same_postcode or same_line1 or slugify_text(candidate) == slugify_text(address):
+                verified_address = address
+                verified_address_fields = selected_fields if any(bool(v) for v in selected_fields.values()) else None
+                break
+
     return {
         "query": query,
         "location": location,
@@ -800,8 +828,8 @@ def build_overall_b2b_summary(query: str, location: Optional[str], results: List
         "source": primary.get("source"),
         "top_domains": [item.get("domain") for item in successful_sorted[:3] if item.get("domain")],
         "domains_scanned": domains_scanned or [],
-        "verified_address": None,
-        "verified_address_fields": None,
+        "verified_address": verified_address,
+        "verified_address_fields": verified_address_fields,
     }
 
 
@@ -1701,6 +1729,592 @@ async def evaluate_business_address_request(request: VerifyBusinessAddressReques
     }
 
 
+# =============================================================================
+# Verified B2B Record Builder
+#
+# Produces an explainable, CRM-ready enrichment record with per-field
+# provenance, confidence, mismatch warnings, and a final business summary.
+# Companies House is treated as the authoritative source where available;
+# website-derived data must pass a name/address/contact match check before
+# fields are accepted.
+# =============================================================================
+
+# Per-source confidence weights (0-100). Higher = more authoritative.
+SOURCE_CONFIDENCE = {
+    "companies_house": 95,
+    "official_website": 80,
+    "cross_referenced": 78,    # phone/address seen on 2+ independent sites
+    "linkedin": 60,
+    "yelp": 55,
+    "google": 55,
+    "directory": 45,
+    "ai_inferred": 35,
+    "discovery": 30,
+    "unknown": 20,
+}
+
+
+def field_record(value: Any,
+                 source: str,
+                 confidence: int,
+                 alternatives: Optional[List[Any]] = None,
+                 notes: Optional[List[str]] = None) -> Dict[str, Any]:
+    """Wrap a value with provenance metadata for the final enrichment record."""
+    return {
+        "value": value,
+        "source": source,
+        "confidence": int(max(0, min(100, confidence))),
+        "alternatives": alternatives or [],
+        "notes": notes or [],
+    }
+
+
+def normalized_postcode(text: str) -> str:
+    return re.sub(r"\s+", "", (text or "").upper())
+
+
+def address_match_signals(ch_address: Optional[str],
+                          candidate_address: Optional[str],
+                          country_hint: Optional[str]) -> Dict[str, Any]:
+    """Compare a Companies House address against another address string.
+
+    Returns match flags (postcode/line1/locality) plus a 0-100 score.
+    Score thresholds: >=80 strong match, 50-79 partial, <50 weak/conflict.
+    """
+    if not ch_address or not candidate_address:
+        return {"score": 0, "same_postcode": False, "same_line1": False,
+                "same_city": False, "conflict": False}
+
+    ch_fields = parse_address_fields(ch_address, country_hint)
+    cand_fields = parse_address_fields(candidate_address, country_hint)
+
+    ch_pc = normalized_postcode(ch_fields.get("postcode") or "")
+    cand_pc = normalized_postcode(cand_fields.get("postcode") or "")
+    same_postcode = bool(ch_pc and cand_pc and ch_pc == cand_pc)
+    pc_conflict = bool(ch_pc and cand_pc and ch_pc != cand_pc)
+
+    ch_line1 = slugify_text(ch_fields.get("line1") or "")
+    cand_line1 = slugify_text(cand_fields.get("line1") or "")
+    same_line1 = bool(ch_line1 and cand_line1 and (ch_line1 == cand_line1
+                                                    or ch_line1 in cand_line1
+                                                    or cand_line1 in ch_line1))
+
+    ch_city = (ch_fields.get("city") or "").strip().lower()
+    cand_city = (cand_fields.get("city") or "").strip().lower()
+    same_city = bool(ch_city and cand_city and ch_city == cand_city)
+
+    score = 0
+    if same_postcode:
+        score += 60
+    if same_line1:
+        score += 25
+    if same_city:
+        score += 15
+    if not (same_postcode or same_line1) and same_city:
+        score = max(score, 20)
+
+    return {
+        "score": min(100, score),
+        "same_postcode": same_postcode,
+        "same_line1": same_line1,
+        "same_city": same_city,
+        "conflict": pc_conflict and not same_line1,
+    }
+
+
+def website_company_match_score(ch_record: Optional[Dict[str, Any]],
+                                website_text: str,
+                                website_domain: str,
+                                ai_data: Optional[Dict[str, Any]],
+                                contact_details: Optional[Dict[str, Any]],
+                                country_hint: Optional[str]) -> Dict[str, Any]:
+    """Score how strongly a website appears to belong to a Companies House record.
+
+    Combines: domain↔name token overlap, address presence on page, postcode
+    co-occurrence, director surname mentions, company-number / "Registered in"
+    markers. Returns score 0-100, list of matched signals, mismatches, and the
+    raw evidence so the caller can attach it to provenance notes.
+    """
+    if not website_domain or not website_text:
+        return {"score": 0, "matches": [], "mismatches": ["no_website_text"], "signals": {}}
+
+    text_lower = website_text.lower()
+    domain_slug = slugify_text(website_domain.split(".")[0])
+    matches: List[str] = []
+    mismatches: List[str] = []
+    signals: Dict[str, Any] = {}
+    score = 0
+
+    ch = ch_record or {}
+    ch_name = str(ch.get("matched_company_name") or "").strip()
+    name_tokens = company_name_tokens(ch_name) if ch_name else []
+    primary_token = name_tokens[0] if name_tokens else ""
+
+    # 1) Domain ↔ company name overlap
+    domain_token_hits = [t for t in name_tokens if t and t in domain_slug]
+    if domain_token_hits:
+        score += 30
+        matches.append(f"domain_contains_name_token({','.join(domain_token_hits)})")
+        signals["domain_token_hits"] = domain_token_hits
+    elif primary_token:
+        mismatches.append("domain_missing_company_name")
+
+    # 2) Page mentions company name
+    if ch_name and ch_name.lower() in text_lower:
+        score += 15
+        matches.append("page_mentions_legal_name")
+    elif name_tokens and sum(1 for t in name_tokens if t in text_lower) >= max(1, len(name_tokens) // 2):
+        score += 8
+        matches.append("page_mentions_name_tokens")
+
+    # 3) Address signals
+    ch_addr = format_registered_office_address(ch.get("registered_office_address"))
+    if ch_addr:
+        ch_fields = parse_address_fields(ch_addr, country_hint)
+        ch_pc = normalized_postcode(ch_fields.get("postcode") or "")
+        ch_line1_slug = slugify_text(ch_fields.get("line1") or "")
+
+        # Find any postcode-shaped tokens on the page.
+        page_postcodes = set()
+        for m in re.finditer(r"[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}", website_text, flags=re.IGNORECASE):
+            page_postcodes.add(normalized_postcode(m.group(0)))
+        for m in re.finditer(r"\b\d{5}(?:-\d{4})?\b", website_text):
+            page_postcodes.add(normalized_postcode(m.group(0)))
+        signals["page_postcodes"] = sorted(page_postcodes)[:8]
+
+        if ch_pc and ch_pc in page_postcodes:
+            score += 25
+            matches.append("postcode_matches_companies_house")
+        elif ch_pc and page_postcodes:
+            mismatches.append(f"page_postcode_differs(ch={ch_pc},page={','.join(sorted(page_postcodes))[:60]})")
+
+        if ch_line1_slug:
+            slug_text = slugify_text(website_text[:20000])
+            if ch_line1_slug in slug_text:
+                score += 15
+                matches.append("address_line1_on_page")
+
+    # 4) Director surname mentions
+    director_hits: List[str] = []
+    for d in (ch.get("directors") or []):
+        if not isinstance(d, dict):
+            continue
+        name = str(d.get("name") or "").strip()
+        if not name:
+            continue
+        # Take the surname (last token) for a less noisy match.
+        surname = name.split()[-1].lower() if name.split() else ""
+        if len(surname) >= 4 and surname in text_lower:
+            director_hits.append(name)
+    if director_hits:
+        score += min(10, 4 * len(director_hits))
+        matches.append(f"director_surname_on_page({len(director_hits)})")
+        signals["director_hits"] = director_hits[:5]
+
+    # 5) Registry markers
+    company_number = str(ch.get("company_number") or "").strip()
+    if company_number and company_number.lower() in text_lower:
+        score += 20
+        matches.append("company_number_on_page")
+    elif re.search(r"registered (?:in|office)\s+(?:england|wales|scotland|northern ireland|uk)", text_lower):
+        score += 5
+        matches.append("registered_in_uk_marker")
+
+    # 6) Phone area-code coherence (rough)
+    if contact_details and isinstance(contact_details, dict):
+        for phone in (contact_details.get("phones") or []):
+            if "+44" in phone or phone.strip().startswith("0"):
+                signals.setdefault("uk_phone_present", True)
+                break
+
+    # 7) Sector / activity hint from AI extraction
+    industry = str((ai_data or {}).get("industry") or "").strip()
+    if industry:
+        signals["ai_industry"] = industry
+
+    return {
+        "score": min(100, score),
+        "matches": matches,
+        "mismatches": mismatches,
+        "signals": signals,
+    }
+
+
+def pick_likely_website(results: List[Dict[str, Any]],
+                        ch_record: Optional[Dict[str, Any]],
+                        country_hint: Optional[str]) -> Dict[str, Any]:
+    """Select the most likely live company website from enrichment results.
+
+    Skips aggregator/directory pages, scores each non-aggregator candidate by
+    `website_company_match_score`, and returns the winner with its match
+    breakdown. Falls back to the highest-confidence non-aggregator result when
+    no Companies House record is available.
+    """
+    candidates: List[Dict[str, Any]] = []
+    for item in results:
+        if item.get("status") != "success":
+            continue
+        if item.get("is_aggregator"):
+            continue
+        domain = item.get("domain") or ""
+        if not domain:
+            continue
+        # Re-fetch the page text once to score address/name presence.
+        text = clean_text_from_url(item.get("url") or f"https://{domain}") or ""
+        match = website_company_match_score(
+            ch_record,
+            text,
+            domain,
+            item.get("enrichment") or {},
+            item.get("contact_details") or {},
+            country_hint,
+        )
+        ai_conf = int(((item.get("confidence") or {}).get("overall")) or 0)
+        # Composite: weight the validator score heavily, with AI confidence as tiebreaker.
+        composite = int(match["score"] * 0.75 + ai_conf * 0.25) if ch_record else int(ai_conf * 0.6 + match["score"] * 0.4)
+        candidates.append({
+            "domain": domain,
+            "url": item.get("url"),
+            "title": item.get("title"),
+            "match_score": match["score"],
+            "composite_score": composite,
+            "matches": match["matches"],
+            "mismatches": match["mismatches"],
+            "signals": match["signals"],
+            "ai_confidence": ai_conf,
+        })
+
+    if not candidates:
+        return {"selected": None, "candidates": []}
+
+    candidates.sort(key=lambda c: (c["composite_score"], c["match_score"], c["ai_confidence"]), reverse=True)
+    return {"selected": candidates[0], "candidates": candidates}
+
+
+def build_ai_business_summary_prompt(record: Dict[str, Any]) -> str:
+    facts = []
+    for key in ["matched_company", "company_number", "company_status",
+                "registered_address", "verified_address", "likely_website",
+                "industry", "phones", "emails", "directors"]:
+        item = record.get(key)
+        if not item:
+            continue
+        if isinstance(item, dict) and "value" in item:
+            facts.append(f"- {key}: {item.get('value')} (source={item.get('source')}, confidence={item.get('confidence')})")
+        else:
+            facts.append(f"- {key}: {item}")
+    fact_block = "\n".join(facts) if facts else "- (no facts)"
+    return f"""
+    You are summarising a verified B2B company profile for a CRM.
+
+    Verified facts:
+    {fact_block}
+
+    Write a single short paragraph (max 60 words) that:
+    - states the company name, status, sector, and where it operates
+    - mentions the official website and registered address only if present
+    - does NOT invent anything not in the facts
+    - is plain prose, no bullet points, no headings
+
+    Return ONLY valid JSON with a single key 'summary' whose value is the paragraph string.
+    """
+
+
+async def run_ai_business_summary(record: Dict[str, Any]) -> Optional[str]:
+    prompt = build_ai_business_summary_prompt(record)
+    loop = asyncio.get_event_loop()
+    try:
+        response = await loop.run_in_executor(
+            None,
+            lambda: ollama.chat(
+                model=AI_MODEL_SUMMARIZER,
+                messages=[{'role': 'user', 'content': prompt}],
+                format='json',
+            ),
+        )
+        parsed = json.loads(response['message']['content'])
+        if isinstance(parsed, dict):
+            value = parsed.get("summary")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    except Exception as e:
+        logger.warning(f"Business summary generation failed: {e}")
+    return None
+
+
+async def build_verified_b2b_record(query: str,
+                                    location: Optional[str],
+                                    results: List[Dict[str, Any]],
+                                    overall_summary: Dict[str, Any]) -> Dict[str, Any]:
+    """Produce the final structured CRM-ready record.
+
+    Layers:
+      1. Companies House record is authoritative for legal identity + registered address.
+      2. Each non-aggregator website is scored against the CH record; the best
+         match becomes the 'likely_website'.
+      3. Verified address combines CH address with cross-referenced web evidence.
+      4. Phones/emails are accepted only when verified (multi-source or on the
+         official site) — provenance recorded per field.
+      5. A specialist summarizer model produces a short business activity narrative.
+
+    Returns a dict containing per-field provenance, validation_notes,
+    mismatch_warnings, and a final 'final_enrichment_summary' string.
+    """
+    successful = [r for r in results if r.get("status") == "success"]
+    record: Dict[str, Any] = {
+        "query": query,
+        "location": location,
+        "matched_company": None,
+        "company_number": None,
+        "company_status": None,
+        "registered_address": None,
+        "verified_address": None,
+        "directors": None,
+        "likely_website": None,
+        "trading_name": None,
+        "industry": None,
+        "phones": None,
+        "emails": None,
+        "social_links": None,
+        "field_confidence": {},
+        "field_sources": {},
+        "validation_notes": [],
+        "mismatch_warnings": [],
+        "final_enrichment_summary": None,
+    }
+
+    def set_field(name: str, fr: Optional[Dict[str, Any]]) -> None:
+        record[name] = fr
+        if fr is None:
+            return
+        record["field_confidence"][name] = fr.get("confidence", 0)
+        record["field_sources"][name] = fr.get("source", "unknown")
+
+    # ---- 1) Pick best Companies House hit (already filtered by overall_summary) ----
+    companies_house_hits = [
+        item for item in successful
+        if isinstance(item.get("companies_house"), dict)
+        and (item["companies_house"].get("company_number") or item["companies_house"].get("matched_company_name"))
+    ]
+    ch_primary = None
+    for item in companies_house_hits:
+        ch = item["companies_house"]
+        matched = str(ch.get("matched_company_name") or "")
+        if not matched:
+            continue
+        # Reuse the same trust check as overall_summary: name overlap with query/summary.
+        summary_name = str(overall_summary.get("company_name") or "")
+        toks_a = set(company_name_tokens(matched))
+        toks_b = set(company_name_tokens(summary_name)) | set(company_name_tokens(query or ""))
+        if toks_a and toks_b and toks_a.intersection(toks_b):
+            ch_primary = ch
+            break
+    if not ch_primary and companies_house_hits:
+        ch_primary = companies_house_hits[0]["companies_house"]
+
+    # ---- 2) Authoritative identity fields from Companies House ----
+    if ch_primary:
+        legal_name = ch_primary.get("matched_company_name")
+        company_number = ch_primary.get("company_number")
+        company_status = ch_primary.get("company_status")
+        if legal_name:
+            set_field("matched_company", field_record(
+                legal_name, "companies_house",
+                SOURCE_CONFIDENCE["companies_house"],
+                notes=["from Companies House register"]))
+        if company_number:
+            set_field("company_number", field_record(
+                company_number, "companies_house",
+                SOURCE_CONFIDENCE["companies_house"]))
+        if company_status:
+            set_field("company_status", field_record(
+                company_status, "companies_house",
+                SOURCE_CONFIDENCE["companies_house"]))
+
+        ch_addr = format_registered_office_address(ch_primary.get("registered_office_address"))
+        if ch_addr:
+            set_field("registered_address", field_record(
+                ch_addr, "companies_house",
+                SOURCE_CONFIDENCE["companies_house"]))
+
+        directors = ch_primary.get("directors") or []
+        if directors:
+            set_field("directors", field_record(
+                directors, "companies_house",
+                SOURCE_CONFIDENCE["companies_house"],
+                notes=[f"{len(directors)} active directors from Companies House"]))
+
+    # Fallback identity from overall_summary when no CH record was found.
+    if not record["matched_company"] and overall_summary.get("company_name"):
+        set_field("matched_company", field_record(
+            overall_summary["company_name"], "ai_inferred",
+            SOURCE_CONFIDENCE["ai_inferred"],
+            notes=["no Companies House match; derived from website/AI"]))
+
+    # ---- 3) Likely website via dedicated validator ----
+    website_choice = await asyncio.get_event_loop().run_in_executor(
+        None, pick_likely_website, results, ch_primary, location,
+    )
+    selected_site = website_choice.get("selected")
+    if selected_site:
+        match_score = int(selected_site.get("match_score") or 0)
+        # Confidence: validator score blended with source authority (official_website).
+        conf = int(SOURCE_CONFIDENCE["official_website"] * 0.5 + match_score * 0.5)
+        notes = [f"validator score {match_score}/100"]
+        if selected_site.get("matches"):
+            notes.append("matches: " + ", ".join(selected_site["matches"][:5]))
+        if selected_site.get("mismatches"):
+            notes.append("mismatches: " + ", ".join(selected_site["mismatches"][:3]))
+            for warn in selected_site["mismatches"]:
+                record["mismatch_warnings"].append(f"website:{selected_site['domain']}: {warn}")
+        alternatives = [
+            {"domain": c["domain"], "match_score": c["match_score"], "composite_score": c["composite_score"]}
+            for c in website_choice.get("candidates", [])[1:4]
+        ]
+        site_url = f"https://{selected_site['domain']}"
+        set_field("likely_website", field_record(
+            site_url, "official_website" if match_score >= 50 else "discovery",
+            conf, alternatives=alternatives, notes=notes))
+    elif overall_summary.get("website"):
+        set_field("likely_website", field_record(
+            overall_summary["website"], "discovery",
+            SOURCE_CONFIDENCE["discovery"],
+            notes=["no validator match; chose top non-aggregator from discovery"]))
+
+    # ---- 4) Verified address: cross-check CH against summary/web evidence ----
+    summary_addr = overall_summary.get("verified_address") or overall_summary.get("address")
+    if record["registered_address"] and summary_addr:
+        ch_addr_value = record["registered_address"]["value"]
+        signals = address_match_signals(ch_addr_value, summary_addr, location)
+        if signals["same_postcode"] or signals["same_line1"]:
+            # Companies House address is corroborated by web sources.
+            set_field("verified_address", field_record(
+                ch_addr_value,
+                "companies_house+cross_referenced",
+                min(99, SOURCE_CONFIDENCE["companies_house"] + 4),
+                notes=[f"address match score {signals['score']}/100",
+                       f"same_postcode={signals['same_postcode']}",
+                       f"same_line1={signals['same_line1']}"]))
+        elif signals["conflict"]:
+            # CH and web disagree on postcode — surface CH as authoritative but flag.
+            set_field("verified_address", field_record(
+                ch_addr_value, "companies_house",
+                SOURCE_CONFIDENCE["companies_house"] - 10,
+                notes=["conflicting address found on web"]))
+            record["mismatch_warnings"].append(
+                f"address: Companies House '{ch_addr_value}' conflicts with web-derived '{summary_addr}'")
+        else:
+            set_field("verified_address", field_record(
+                ch_addr_value, "companies_house",
+                SOURCE_CONFIDENCE["companies_house"] - 5,
+                notes=["web evidence neither corroborated nor conflicted"]))
+    elif record["registered_address"]:
+        set_field("verified_address", field_record(
+            record["registered_address"]["value"], "companies_house",
+            SOURCE_CONFIDENCE["companies_house"] - 8,
+            notes=["no independent web corroboration available"]))
+    elif summary_addr:
+        # No CH record; rely on cross-referenced web evidence.
+        set_field("verified_address", field_record(
+            summary_addr, "cross_referenced",
+            SOURCE_CONFIDENCE["cross_referenced"],
+            notes=["no Companies House record; derived from web cross-reference"]))
+
+    # ---- 5) Phones: only verified ones from overall_summary survive ----
+    verified_phones = list(overall_summary.get("phones") or [])
+    if verified_phones:
+        set_field("phones", field_record(
+            verified_phones, "cross_referenced",
+            SOURCE_CONFIDENCE["cross_referenced"],
+            notes=["validated by libphonenumber and seen on official site or 2+ sources"]))
+
+    # ---- 6) Emails ----
+    emails = list(overall_summary.get("emails") or [])
+    if emails:
+        # Only treat as official if the email domain matches the chosen website.
+        site_value = (record.get("likely_website") or {}).get("value") or ""
+        site_domain = normalize_domain(site_value) if site_value else ""
+        official_emails = [e for e in emails if site_domain and e.lower().endswith("@" + site_domain)]
+        if official_emails:
+            set_field("emails", field_record(
+                official_emails, "official_website",
+                SOURCE_CONFIDENCE["official_website"],
+                alternatives=[e for e in emails if e not in official_emails],
+                notes=["email domain matches likely_website"]))
+        else:
+            set_field("emails", field_record(
+                emails, "discovery",
+                SOURCE_CONFIDENCE["discovery"],
+                notes=["email domain does not match likely_website; treat as low-confidence"]))
+
+    # ---- 7) Industry / sector via AI on best result ----
+    best_ai = None
+    for item in successful:
+        enr = item.get("enrichment") or {}
+        if isinstance(enr, dict) and enr.get("industry"):
+            best_ai = enr
+            break
+    if best_ai:
+        set_field("industry", field_record(
+            best_ai.get("industry"), "ai_inferred",
+            SOURCE_CONFIDENCE["ai_inferred"] + 10,
+            notes=["extracted from website text by local model"]))
+
+    # ---- 8) Trading name vs registered name ----
+    if record["matched_company"]:
+        legal = str(record["matched_company"]["value"])
+        ai_name = ""
+        for item in successful:
+            cand = str(((item.get("enrichment") or {}).get("company_name") or "")).strip()
+            if cand:
+                ai_name = cand
+                break
+        if ai_name and slugify_text(ai_name) != slugify_text(legal):
+            # Genuinely different from the legal name → likely a trading name.
+            if not any(suffix in ai_name.lower() for suffix in ["limited", "ltd", "plc", "llp"]):
+                set_field("trading_name", field_record(
+                    ai_name, "ai_inferred",
+                    SOURCE_CONFIDENCE["ai_inferred"],
+                    notes=["differs from registered legal name"]))
+
+    # ---- 9) Social links ----
+    social_links: Dict[str, str] = {}
+    for item in successful:
+        enr = item.get("enrichment") or {}
+        ln = str(enr.get("linkedin_url") or "").strip()
+        if ln and "linkedin" not in social_links:
+            social_links["linkedin"] = ln
+        for url_key in ("url",):
+            url = str(item.get(url_key) or "")
+            for platform in ("facebook.com", "twitter.com", "instagram.com"):
+                if platform in url and platform.split(".")[0] not in social_links:
+                    social_links[platform.split(".")[0]] = url
+    if social_links:
+        set_field("social_links", field_record(
+            social_links, "discovery",
+            SOURCE_CONFIDENCE["discovery"] + 10,
+            notes=["collected from discovery results"]))
+
+    # ---- 10) Validation notes summary ----
+    if ch_primary:
+        record["validation_notes"].append("Companies House record used as authoritative source")
+    else:
+        record["validation_notes"].append("No Companies House record matched; results derived from web only")
+    if selected_site and selected_site.get("match_score", 0) >= 50:
+        record["validation_notes"].append(
+            f"Website {selected_site['domain']} validated against Companies House (score {selected_site['match_score']}/100)")
+    elif selected_site:
+        record["validation_notes"].append(
+            f"Website {selected_site['domain']} chosen but failed strong validation (score {selected_site['match_score']}/100)")
+
+    # ---- 11) AI business activity summary (specialist summarizer model) ----
+    summary_text = await run_ai_business_summary(record)
+    if summary_text:
+        record["final_enrichment_summary"] = summary_text
+
+    return record
+
+
 def is_uk_location(location: Optional[str]) -> bool:
     if not location:
         return False
@@ -2422,6 +3036,16 @@ async def crawl_businesses(request: CrawlBusinessesRequest):
     except Exception as e:
         logger.warning(f"Address verification in enrichment failed: {e}")
 
+    # ---- Build the explainable, CRM-ready verified B2B record ----
+    try:
+        verified_record = await build_verified_b2b_record(
+            request.query, request.location, results, overall_summary,
+        )
+        overall_summary["verified_record"] = verified_record
+    except Exception as e:
+        logger.warning(f"Verified record build failed: {e}")
+        verified_record = None
+
     return {
         "query": request.query,
         "location": request.location,
@@ -2429,7 +3053,51 @@ async def crawl_businesses(request: CrawlBusinessesRequest):
         "domains_scanned": domains_scanned,
         "results": results,
         "processing_model": AI_MODEL,
+        "models": {
+            "default": AI_MODEL,
+            "matcher": AI_MODEL_MATCHER,
+            "validator": AI_MODEL_VALIDATOR,
+            "address": AI_MODEL_ADDRESS,
+            "classifier": AI_MODEL_CLASSIFIER,
+            "summarizer": AI_MODEL_SUMMARIZER,
+        },
         "overall_summary": overall_summary,
+        "verified_record": verified_record,
+    }
+
+
+@app.post("/enrich-verified", tags=["Enrichment"])
+async def enrich_verified_endpoint(request: CrawlBusinessesRequest):
+    """
+    Verification-first enrichment optimised for CRM import.
+
+    Runs the full discovery + Companies House + website-validation pipeline and
+    returns ONLY the explainable verified record:
+      - matched_company, company_number, company_status
+      - registered_address, verified_address (with cross-reference notes)
+      - directors (Companies House, when available)
+      - likely_website (validated against Companies House signals)
+      - phones, emails, industry, social_links, trading_name
+      - field_confidence and field_sources for every field
+      - validation_notes and mismatch_warnings
+      - final_enrichment_summary (short paragraph from local summarizer model)
+
+    Companies House is the primary source where a record matches the query.
+    Other fields are accepted only when corroborated; conflicts are surfaced as
+    mismatch_warnings rather than silently overwriting authoritative data.
+    """
+    full = await crawl_businesses(request)
+    if not isinstance(full, dict):
+        raise HTTPException(status_code=500, detail="Enrichment pipeline returned unexpected payload")
+    record = full.get("verified_record")
+    if not record:
+        raise HTTPException(status_code=404, detail="No verified record could be produced for this query")
+    return {
+        "query": request.query,
+        "location": request.location,
+        "models": full.get("models"),
+        "domains_scanned": full.get("domains_scanned"),
+        "verified_record": record,
     }
 
 PYEOF
@@ -2458,6 +3126,11 @@ Group=$APP_USER
 WorkingDirectory=$APP_DIR/app
 Environment="PATH=$VENV_DIR/bin"
 Environment="AI_MODEL_NAME=$SELECTED_MODEL"
+Environment="AI_MODEL_MATCHER=${AI_MODEL_MATCHER:-$SELECTED_MODEL}"
+Environment="AI_MODEL_VALIDATOR=${AI_MODEL_VALIDATOR:-$SELECTED_MODEL}"
+Environment="AI_MODEL_ADDRESS=${AI_MODEL_ADDRESS:-$SELECTED_MODEL}"
+Environment="AI_MODEL_CLASSIFIER=${AI_MODEL_CLASSIFIER:-$SELECTED_MODEL}"
+Environment="AI_MODEL_SUMMARIZER=${AI_MODEL_SUMMARIZER:-$SELECTED_MODEL}"
 Environment="COMPANIES_HOUSE_API_KEY=${COMPANIES_HOUSE_API_KEY:-}"
 Environment="OLLAMA_NUM_PARALLEL=$OLLAMA_NUM_PARALLEL"
 Environment="OLLAMA_KEEP_ALIVE=-1"
@@ -2490,6 +3163,11 @@ else
     pkill -f "uvicorn main:app" 2>/dev/null || true
     cd $APP_DIR/app
     export AI_MODEL_NAME=$SELECTED_MODEL
+    export AI_MODEL_MATCHER=${AI_MODEL_MATCHER:-$SELECTED_MODEL}
+    export AI_MODEL_VALIDATOR=${AI_MODEL_VALIDATOR:-$SELECTED_MODEL}
+    export AI_MODEL_ADDRESS=${AI_MODEL_ADDRESS:-$SELECTED_MODEL}
+    export AI_MODEL_CLASSIFIER=${AI_MODEL_CLASSIFIER:-$SELECTED_MODEL}
+    export AI_MODEL_SUMMARIZER=${AI_MODEL_SUMMARIZER:-$SELECTED_MODEL}
     export COMPANIES_HOUSE_API_KEY=${COMPANIES_HOUSE_API_KEY:-}
     export OLLAMA_NUM_PARALLEL=$OLLAMA_NUM_PARALLEL
     export OLLAMA_SCHED_SPREAD=$OLLAMA_SCHED_SPREAD
