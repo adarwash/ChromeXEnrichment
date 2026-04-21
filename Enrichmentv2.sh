@@ -239,7 +239,7 @@ Features:
 - **Overall summary** — cross-referenced B2B profile with Companies House priority, verified phones, domains_scanned
 - **Parallel processing** — concurrent AI inference, Companies House lookups, and page crawling
 """,
-    version="2.6.0"
+    version="2.6.1"
 )
 
 # --- Pydantic Models ---
@@ -2068,7 +2068,9 @@ async def build_verified_b2b_record(query: str,
         "company_number": None,
         "company_status": None,
         "registered_address": None,
+        "registered_address_fields": None,
         "verified_address": None,
+        "verified_address_fields": None,
         "directors": None,
         "likely_website": None,
         "trading_name": None,
@@ -2136,6 +2138,9 @@ async def build_verified_b2b_record(query: str,
             set_field("registered_address", field_record(
                 ch_addr, "companies_house",
                 SOURCE_CONFIDENCE["companies_house"]))
+            ch_addr_fields = parse_address_fields(ch_addr, location)
+            if any(bool(v) for v in ch_addr_fields.values()):
+                record["registered_address_fields"] = ch_addr_fields
 
         directors = ch_primary.get("directors") or []
         if directors:
@@ -2195,12 +2200,18 @@ async def build_verified_b2b_record(query: str,
                 notes=[f"address match score {signals['score']}/100",
                        f"same_postcode={signals['same_postcode']}",
                        f"same_line1={signals['same_line1']}"]))
+            verified_fields = parse_address_fields(ch_addr_value, location)
+            if any(bool(v) for v in verified_fields.values()):
+                record["verified_address_fields"] = verified_fields
         elif signals["conflict"]:
             # CH and web disagree on postcode — surface CH as authoritative but flag.
             set_field("verified_address", field_record(
                 ch_addr_value, "companies_house",
                 SOURCE_CONFIDENCE["companies_house"] - 10,
                 notes=["conflicting address found on web"]))
+            verified_fields = parse_address_fields(ch_addr_value, location)
+            if any(bool(v) for v in verified_fields.values()):
+                record["verified_address_fields"] = verified_fields
             record["mismatch_warnings"].append(
                 f"address: Companies House '{ch_addr_value}' conflicts with web-derived '{summary_addr}'")
         else:
@@ -2208,17 +2219,26 @@ async def build_verified_b2b_record(query: str,
                 ch_addr_value, "companies_house",
                 SOURCE_CONFIDENCE["companies_house"] - 5,
                 notes=["web evidence neither corroborated nor conflicted"]))
+            verified_fields = parse_address_fields(ch_addr_value, location)
+            if any(bool(v) for v in verified_fields.values()):
+                record["verified_address_fields"] = verified_fields
     elif record["registered_address"]:
         set_field("verified_address", field_record(
             record["registered_address"]["value"], "companies_house",
             SOURCE_CONFIDENCE["companies_house"] - 8,
             notes=["no independent web corroboration available"]))
+        verified_fields = parse_address_fields(record["registered_address"]["value"], location)
+        if any(bool(v) for v in verified_fields.values()):
+            record["verified_address_fields"] = verified_fields
     elif summary_addr:
         # No CH record; rely on cross-referenced web evidence.
         set_field("verified_address", field_record(
             summary_addr, "cross_referenced",
             SOURCE_CONFIDENCE["cross_referenced"],
             notes=["no Companies House record; derived from web cross-reference"]))
+        verified_fields = parse_address_fields(summary_addr, location)
+        if any(bool(v) for v in verified_fields.values()):
+            record["verified_address_fields"] = verified_fields
 
     # ---- 5) Phones: only verified ones from overall_summary survive ----
     verified_phones = list(overall_summary.get("phones") or [])
