@@ -197,6 +197,7 @@ import logging
 import os
 import asyncio
 import re
+import html as html_lib
 import smtplib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, List, Dict, Any
@@ -318,7 +319,7 @@ def normalize_domain(raw_url: str) -> str:
     return host
 
 
-def fetch_html_from_url(url: str) -> Optional[str]:
+def fetch_html_from_url(url: str, allow_non_html: bool = False) -> Optional[str]:
     try:
         resp = requests.get(
             url,
@@ -326,7 +327,7 @@ def fetch_html_from_url(url: str) -> Optional[str]:
             headers={"User-Agent": "Mozilla/5.0 (compatible; B2BEnricher/1.0)"},
         )
         resp.raise_for_status()
-        if "text/html" not in resp.headers.get("content-type", "").lower():
+        if not allow_non_html and "text/html" not in resp.headers.get("content-type", "").lower():
             return None
         return resp.text
     except Exception:
@@ -1059,7 +1060,38 @@ def discover_business_urls(query: str, location: Optional[str], max_results: int
     if location:
         search_query = f"{search_query} {location.strip()}"
 
-    return search_public_results(search_query, max_results)
+    blocked_domains = {
+        "bing.com", "www.bing.com", "duckduckgo.com", "www.duckduckgo.com",
+        "search.yahoo.com", "yahoo.com", "www.yahoo.com",
+    }
+    candidates: List[Dict[str, str]] = []
+    seen_domains: set = set()
+
+    # Two-pass query strategy:
+    # 1) original query (can include phone)
+    # 2) cleaned company-name query (phone removed) to avoid reverse-phone/ad spam
+    query_variants: List[str] = [search_query]
+    cleaned = strip_phones_from_text(search_query)
+    if cleaned and cleaned.lower() != search_query.lower():
+        query_variants.append(cleaned)
+
+    for q in query_variants:
+        for item in search_public_results(q, max_results * 3):
+            domain = (item.get("domain") or "").lower()
+            url = item.get("url") or ""
+            if not domain or not url:
+                continue
+            if domain in blocked_domains or domain.endswith(".bing.com") or domain.endswith(".yahoo.com"):
+                continue
+            if "/aclick" in url.lower() or "trafficguard.ai" in url.lower():
+                continue
+            if domain in seen_domains:
+                continue
+            seen_domains.add(domain)
+            candidates.append(item)
+            if len(candidates) >= max_results:
+                return candidates
+    return candidates
 
 
 def search_public_results(query: str, max_results: int) -> List[Dict[str, str]]:
@@ -1135,6 +1167,7 @@ def _search_bing(query: str, max_results: int) -> List[Dict[str, str]]:
     soup = BeautifulSoup(resp.text, "html.parser")
     results: List[Dict[str, str]] = []
     seen: set = set()
+    blocked_domains = {"bing.com", "www.bing.com", "r.bing.com", "cn.bing.com"}
     # Bing wraps each organic hit in <li class="b_algo"> with an <h2><a href=...>.
     for li in soup.select("li.b_algo"):
         a = li.select_one("h2 a") or li.select_one("a")
@@ -1143,14 +1176,19 @@ def _search_bing(query: str, max_results: int) -> List[Dict[str, str]]:
         href = a.get("href") or ""
         if not href.startswith("http"):
             continue
+        # Exclude Bing ad-click and tracking URLs (aclick/ck/a) that are not
+        # organic destination pages.
+        href_lower = href.lower()
+        if "bing.com/aclick" in href_lower or "bing.com/ck/a" in href_lower:
+            continue
         # Bing sometimes wraps URLs in a redirect; the visible href is usually direct.
         key = href.lower().strip()
         if key in seen:
             continue
-        seen.add(key)
         domain = normalize_domain(href)
-        if not domain:
+        if not domain or domain in blocked_domains or domain.endswith(".bing.com"):
             continue
+        seen.add(key)
         results.append({
             "title": a.get_text(" ", strip=True),
             "url": href,
@@ -2677,23 +2715,31 @@ def _decode_obfuscated_emails(html: str) -> List[str]:
     if not html:
         return []
     found: List[str] = []
+    decoded_html = html_lib.unescape(html)
     # 1) mailto: links (may be HTML-entity encoded).
-    for m in re.finditer(r"mailto:([^\"'?>\s]+)", html, flags=re.IGNORECASE):
+    for m in re.finditer(r"mailto:([^\"'?>\s]+)", decoded_html, flags=re.IGNORECASE):
         raw = m.group(1)
         # Decode HTML entities and URL encoding.
         raw = raw.replace("&#64;", "@").replace("%40", "@")
         raw = re.sub(r"&#(\d+);", lambda mm: chr(int(mm.group(1))), raw)
         found.append(raw)
     # 2) Plain-text emails.
-    for m in re.finditer(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", html):
+    for m in re.finditer(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", decoded_html):
         found.append(m.group(0))
     # 3) "name [at] domain [dot] com" style.
     patt = re.compile(
         r"([A-Za-z0-9._%+\-]+)\s*(?:\[at\]|\(at\)|\{at\}|\s+at\s+)\s*([A-Za-z0-9.\-]+)\s*(?:\[dot\]|\(dot\)|\{dot\}|\s+dot\s+)\s*([A-Za-z]{2,})",
         flags=re.IGNORECASE,
     )
-    for m in patt.finditer(html):
+    for m in patt.finditer(decoded_html):
         found.append(f"{m.group(1)}@{m.group(2)}.{m.group(3)}")
+    # 4) JS concatenation style, e.g. 'info' + '@' + 'example.com'.
+    js_cat = re.compile(
+        r"['\"]([A-Za-z0-9._%+\-]{1,64})['\"]\s*\+\s*['\"]@['\"]\s*\+\s*['\"]([A-Za-z0-9.\-]+\.[A-Za-z]{2,})['\"]",
+        flags=re.IGNORECASE,
+    )
+    for m in js_cat.finditer(decoded_html):
+        found.append(f"{m.group(1)}@{m.group(2)}")
     return found
 
 
@@ -2719,8 +2765,13 @@ def discover_company_emails(site_domain: str,
                 urls.append(link)
     if extra_urls:
         for u in extra_urls:
-            if u and u not in urls:
-                urls.append(u)
+            if not u:
+                continue
+            # Keep only in-domain URLs; ignore trackers / foreign domains.
+            if normalize_domain(u) != site_domain:
+                continue
+            if u not in urls:
+                urls.insert(0, u)
 
     urls = urls[:max_pages * 2]  # hard cap
     found_emails: Dict[str, Dict[str, Any]] = {}
@@ -2731,6 +2782,33 @@ def discover_company_emails(site_domain: str,
         if not html:
             return {"url": url, "emails": []}
         raw_emails = _decode_obfuscated_emails(html)
+        # Also scan first-party script bundles for hardcoded addresses.
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+            script_links: List[str] = []
+            for script in soup.select("script[src]"):
+                src = script.get("src") or ""
+                if not src:
+                    continue
+                if src.startswith("//"):
+                    src = "https:" + src
+                elif src.startswith("/"):
+                    src = urljoin(url, src)
+                elif not src.startswith("http"):
+                    continue
+                if normalize_domain(src) != site_domain:
+                    continue
+                if src not in script_links:
+                    script_links.append(src)
+                if len(script_links) >= 8:
+                    break
+            for src in script_links:
+                js = fetch_html_from_url(src, allow_non_html=True)
+                if not js:
+                    continue
+                raw_emails.extend(_decode_obfuscated_emails(js))
+        except Exception:
+            pass
         return {"url": url, "emails": raw_emails}
 
     with ThreadPoolExecutor(max_workers=min(8, max(1, len(urls)))) as executor:
@@ -2740,9 +2818,11 @@ def discover_company_emails(site_domain: str,
                 r = fut.result()
             except Exception:
                 continue
+            # Record successfully fetched pages even if no emails were found.
+            if r.get("url") and r["url"] not in pages_crawled:
+                pages_crawled.append(r["url"])
             if not r.get("emails"):
                 continue
-            pages_crawled.append(r["url"])
             for raw in r["emails"]:
                 email = _clean_email_candidate(raw)
                 if not email:
@@ -2853,6 +2933,21 @@ async def build_verified_b2b_record(query: str,
             break
     if not ch_primary and companies_house_hits:
         ch_primary = companies_house_hits[0]["companies_house"]
+    if not ch_primary:
+        # When web discovery is noisy/empty, still try a direct CH lookup using
+        # a cleaned query string (remove phones and location noise).
+        query_for_ch = strip_phones_from_text(query or "")
+        query_for_ch = re.sub(r"\b(united kingdom|uk|england|scotland|wales|northern ireland)\b", " ", query_for_ch, flags=re.IGNORECASE)
+        query_for_ch = re.sub(r"\s+", " ", query_for_ch).strip()
+        if query_for_ch:
+            try:
+                direct_ch = await asyncio.get_event_loop().run_in_executor(
+                    None, companies_house_lookup_by_name, query_for_ch,
+                )
+                if isinstance(direct_ch, dict) and (direct_ch.get("matched_company_name") or direct_ch.get("company_number")):
+                    ch_primary = direct_ch
+            except Exception as e:
+                logger.warning(f"Direct Companies House fallback failed: {e}")
 
     # ---- 2) Authoritative identity fields from Companies House ----
     if ch_primary:
@@ -3098,8 +3193,13 @@ async def build_verified_b2b_record(query: str,
 
     if site_domain and site_source == "official_website" and not is_junk_website_domain(site_domain):
         try:
+            seed_urls: List[str] = []
+            if selected_site and selected_site.get("url"):
+                seed_urls.append(str(selected_site.get("url")))
+            if site_value:
+                seed_urls.append(site_value)
             discovery = await asyncio.get_event_loop().run_in_executor(
-                None, discover_company_emails, site_domain, None, location, 10,
+                None, discover_company_emails, site_domain, seed_urls, location, 10,
             )
         except Exception as e:
             logger.warning(f"Email discovery failed for {site_domain}: {e}")
@@ -3158,14 +3258,58 @@ async def build_verified_b2b_record(query: str,
                 ],
             }
         else:
-            record["email_details"] = {
-                "domain": site_domain,
-                "mx_valid": discovery.get("mx_valid"),
-                "pages_crawled": discovery.get("pages_crawled"),
-                "entries": [],
-            }
-            record["validation_notes"].append(
-                f"No emails found on official website {site_domain}")
+            # Fallback: infer common role-based mailbox on the validated domain.
+            # Some sites hide emails behind JS/apps or forms; this provides a
+            # low-confidence candidate instead of returning none.
+            inferred_candidates = [
+                f"info@{site_domain}",
+                f"enquiries@{site_domain}",
+                f"hello@{site_domain}",
+                f"contact@{site_domain}",
+            ]
+            if discovery.get("mx_valid"):
+                primary = inferred_candidates[0]
+                primary_meta = classify_email(primary, site_domain)
+                primary_meta.update({
+                    "email": primary,
+                    "sources": ["heuristic:common_role_account"],
+                    "inferred": True,
+                })
+
+                set_field("emails", field_record(
+                    [primary], "ai_inferred", SOURCE_CONFIDENCE["ai_inferred"],
+                    alternatives=inferred_candidates[1:],
+                    notes=[
+                        "No explicit email found on fetched pages; inferred common role mailbox",
+                        f"domain MX valid: {discovery.get('mx_valid')}",
+                    ],
+                ))
+
+                record["email_details"] = {
+                    "domain": site_domain,
+                    "mx_valid": discovery.get("mx_valid"),
+                    "pages_crawled": discovery.get("pages_crawled"),
+                    "entries": [
+                        {
+                            "email": primary_meta["email"],
+                            "role": primary_meta.get("role"),
+                            "is_role_account": primary_meta.get("is_role_account"),
+                            "is_personal": primary_meta.get("is_personal"),
+                            "is_official_domain": primary_meta.get("is_official_domain"),
+                            "sources": primary_meta.get("sources") or [],
+                            "inferred": True,
+                        }
+                    ],
+                }
+            else:
+                record["email_details"] = {
+                    "domain": site_domain,
+                    "mx_valid": discovery.get("mx_valid"),
+                    "pages_crawled": discovery.get("pages_crawled"),
+                    "entries": [],
+                }
+                record["validation_notes"].append(
+                    f"No emails found on official website {site_domain}")
     else:
         # No validated official website → don't surface emails at all.
         record["validation_notes"].append(
