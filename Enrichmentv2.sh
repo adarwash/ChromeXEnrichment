@@ -131,6 +131,7 @@ ensure_ollama_running
 
 SELECTED_MODEL=""
 MODEL_NAME=""
+SPECIALIST_MODEL_DEFAULT=""
 
 # Logic Tree
 if [ "$AVAIL_DISK_GB" -lt 6 ]; then
@@ -155,8 +156,21 @@ else
     echo "[+] CPU Mode. Selecting lightweight model: $SELECTED_MODEL"
 fi
 
+# Specialist tasks (entity match / validation / classification) are much
+# faster on 8B while still accurate for structured extraction. Keep the final
+# narrative summarizer on the main selected model.
+if [ "$SELECTED_MODEL" = "mistral-small:24b" ]; then
+    SPECIALIST_MODEL_DEFAULT="llama3.1:8b"
+else
+    SPECIALIST_MODEL_DEFAULT="$SELECTED_MODEL"
+fi
+
 echo "[*] Pulling AI Model: $SELECTED_MODEL (This may take time...)"
 ollama pull $SELECTED_MODEL
+if [ "$SPECIALIST_MODEL_DEFAULT" != "$SELECTED_MODEL" ]; then
+    echo "[*] Pulling Specialist Model: $SPECIALIST_MODEL_DEFAULT"
+    ollama pull $SPECIALIST_MODEL_DEFAULT
+fi
 
 # Set environment variable for the app to know which model is in use
 export AI_MODEL_NAME=$SELECTED_MODEL
@@ -197,6 +211,7 @@ import logging
 import os
 import asyncio
 import re
+import time
 import html as html_lib
 import smtplib
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1094,12 +1109,20 @@ def discover_business_urls(query: str, location: Optional[str], max_results: int
     return candidates
 
 
+_DDG_DISABLED_UNTIL = 0.0  # process-level circuit breaker; epoch seconds
+
 def search_public_results(query: str, max_results: int) -> List[Dict[str, str]]:
     """Search public web results, falling back across providers when one is
     rate-limited or returns nothing. Currently: DuckDuckGo HTML → Yahoo HTML
     redirects → Bing HTML.
+
+    DuckDuckGo is skipped (circuit-broken) for 5 minutes after a failure,
+    because in some hosting environments DDG is blocked and waiting on its
+    connect timeout dominates total request latency.
     """
-    results = _search_duckduckgo(query, max_results)
+    results: List[Dict[str, str]] = []
+    if time.time() >= _DDG_DISABLED_UNTIL:
+        results = _search_duckduckgo(query, max_results)
     if not results:
         results = _search_yahoo(query, max_results)
     if not results:
@@ -1108,11 +1131,13 @@ def search_public_results(query: str, max_results: int) -> List[Dict[str, str]]:
 
 
 def _search_duckduckgo(query: str, max_results: int) -> List[Dict[str, str]]:
+    global _DDG_DISABLED_UNTIL
     try:
         resp = requests.post(
             "https://html.duckduckgo.com/html/",
             data={"q": query},
-            timeout=20,
+            # (connect, read) — fail fast on connect; DDG is blocked on some hosts.
+            timeout=(3, 8),
             headers={
                 "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                               "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -1121,7 +1146,11 @@ def _search_duckduckgo(query: str, max_results: int) -> List[Dict[str, str]]:
         )
         resp.raise_for_status()
     except Exception as e:
-        logger.warning(f"DuckDuckGo search failed for '{query[:60]}': {e}")
+        # Trip a 5-minute circuit breaker so subsequent queries skip DDG and
+        # go straight to Yahoo/Bing. Avoids paying connect timeouts repeatedly
+        # on hosts where DDG is blocked.
+        _DDG_DISABLED_UNTIL = time.time() + 300
+        logger.warning(f"DuckDuckGo search failed for '{query[:60]}': {e} (disabled 5m)")
         return []
 
     soup = BeautifulSoup(resp.text, "html.parser")
@@ -3952,6 +3981,36 @@ async def crawl_businesses(request: CrawlBusinessesRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Discovery failed: {e}")
 
+    # Precompute Companies House lookup once per request instead of once per
+    # candidate. This removes duplicate network calls and cuts latency
+    # significantly on multi-result queries.
+    shared_companies_house: Optional[Dict[str, Any]] = None
+    if is_uk_location(request.location):
+        try:
+            shared_companies_house = await asyncio.get_event_loop().run_in_executor(
+                None,
+                companies_house_lookup_by_name,
+                request.query,
+            )
+        except Exception as e:
+            logger.warning(f"Shared Companies House lookup failed: {e}")
+
+    aggregator_domains = {
+        "efinder.uk", "opengovuk.com", "checkcompany.co.uk",
+        "find-and-update.company-information.service.gov.uk",
+        "endole.co.uk", "companieslist.co.uk", "companycheck.co.uk",
+        "dnb.com", "duedil.com", "opencorporates.com",
+        "companiesintheuk.co.uk", "ukdata.com", "192.com",
+        "cylex-uk.co.uk", "brownbook.net", "hotfrog.co.uk",
+        "scoot.co.uk", "thomsonlocal.com", "yell.com",
+        "yelp.com", "yelp.co.uk", "trustpilot.com",
+        "glassdoor.co.uk", "glassdoor.com", "indeed.co.uk",
+        "linkedin.com", "facebook.com", "twitter.com",
+        "instagram.com", "tiktok.com", "pinterest.com",
+        "crunchbase.com", "zoominfo.com",
+        "bing.com", "duckduckgo.com", "search.yahoo.com", "yahoo.com",
+    }
+
     async def enrich_candidate(item: Dict[str, str]):
         text = await asyncio.get_event_loop().run_in_executor(None, clean_text_from_url, item["url"])
         if not text:
@@ -3966,47 +4025,19 @@ async def crawl_businesses(request: CrawlBusinessesRequest):
             "discovery_query": request.query,
             "location": request.location or "",
         }
-        # Run AI extraction and Companies House lookup in parallel for speed.
-        ai_task = run_ai_extraction(text, hints=hints)
-        ch_task = None
-        if is_uk_location(request.location):
-            # Use query/company intent, not result title, to avoid mismatching
-            # similarly named companies from directory pages.
-            lookup_name = request.query
-            ch_task = asyncio.get_event_loop().run_in_executor(
-                None,
-                companies_house_lookup_by_name,
-                lookup_name,
-            )
+        candidate_domain = item.get("domain", "")
+        is_aggregator = any(candidate_domain == agg or candidate_domain.endswith("." + agg) for agg in aggregator_domains)
 
-        ai_data = await ai_task
-        companies_house = (await ch_task) if ch_task else None
+        # Skip heavy AI extraction for known aggregator/directory/search pages.
+        # These rarely represent the target business and mostly add latency.
+        ai_data = None if is_aggregator else await run_ai_extraction(text, hints=hints)
+        companies_house = shared_companies_house
 
         if companies_house and isinstance(companies_house, dict):
             # Merge Companies House directors into enrichment if model missed them.
             if isinstance(ai_data, dict) and isinstance(companies_house.get("directors"), list):
                 if not ai_data.get("directors"):
                     ai_data["directors"] = companies_house.get("directors")
-
-        # Only extract phones/emails from the company's own website.
-        # Directory/aggregator pages list many businesses so their contact
-        # details would pollute the results with unrelated numbers.
-        aggregator_domains = {
-            "efinder.uk", "opengovuk.com", "checkcompany.co.uk",
-            "find-and-update.company-information.service.gov.uk",
-            "endole.co.uk", "companieslist.co.uk", "companycheck.co.uk",
-            "dnb.com", "duedil.com", "opencorporates.com",
-            "companiesintheuk.co.uk", "ukdata.com", "192.com",
-            "cylex-uk.co.uk", "brownbook.net", "hotfrog.co.uk",
-            "scoot.co.uk", "thomsonlocal.com", "yell.com",
-            "yelp.com", "yelp.co.uk", "trustpilot.com",
-            "glassdoor.co.uk", "glassdoor.com", "indeed.co.uk",
-            "linkedin.com", "facebook.com", "twitter.com",
-            "instagram.com", "tiktok.com", "pinterest.com",
-            "crunchbase.com", "zoominfo.com",
-        }
-        candidate_domain = item.get("domain", "")
-        is_aggregator = any(candidate_domain == agg or candidate_domain.endswith("." + agg) for agg in aggregator_domains)
 
         # Avoid confidence inflation from directory pages that list many phone/email snippets.
         confidence_text = "" if is_aggregator else text
@@ -4194,10 +4225,10 @@ Group=$APP_USER
 WorkingDirectory=$APP_DIR/app
 Environment="PATH=$VENV_DIR/bin"
 Environment="AI_MODEL_NAME=$SELECTED_MODEL"
-Environment="AI_MODEL_MATCHER=${AI_MODEL_MATCHER:-$SELECTED_MODEL}"
-Environment="AI_MODEL_VALIDATOR=${AI_MODEL_VALIDATOR:-$SELECTED_MODEL}"
-Environment="AI_MODEL_ADDRESS=${AI_MODEL_ADDRESS:-$SELECTED_MODEL}"
-Environment="AI_MODEL_CLASSIFIER=${AI_MODEL_CLASSIFIER:-$SELECTED_MODEL}"
+Environment="AI_MODEL_MATCHER=${AI_MODEL_MATCHER:-$SPECIALIST_MODEL_DEFAULT}"
+Environment="AI_MODEL_VALIDATOR=${AI_MODEL_VALIDATOR:-$SPECIALIST_MODEL_DEFAULT}"
+Environment="AI_MODEL_ADDRESS=${AI_MODEL_ADDRESS:-$SPECIALIST_MODEL_DEFAULT}"
+Environment="AI_MODEL_CLASSIFIER=${AI_MODEL_CLASSIFIER:-$SPECIALIST_MODEL_DEFAULT}"
 Environment="AI_MODEL_SUMMARIZER=${AI_MODEL_SUMMARIZER:-$SELECTED_MODEL}"
 Environment="COMPANIES_HOUSE_API_KEY=${COMPANIES_HOUSE_API_KEY:-}"
 Environment="OLLAMA_NUM_PARALLEL=$OLLAMA_NUM_PARALLEL"
@@ -4231,10 +4262,10 @@ else
     pkill -f "uvicorn main:app" 2>/dev/null || true
     cd $APP_DIR/app
     export AI_MODEL_NAME=$SELECTED_MODEL
-    export AI_MODEL_MATCHER=${AI_MODEL_MATCHER:-$SELECTED_MODEL}
-    export AI_MODEL_VALIDATOR=${AI_MODEL_VALIDATOR:-$SELECTED_MODEL}
-    export AI_MODEL_ADDRESS=${AI_MODEL_ADDRESS:-$SELECTED_MODEL}
-    export AI_MODEL_CLASSIFIER=${AI_MODEL_CLASSIFIER:-$SELECTED_MODEL}
+    export AI_MODEL_MATCHER=${AI_MODEL_MATCHER:-$SPECIALIST_MODEL_DEFAULT}
+    export AI_MODEL_VALIDATOR=${AI_MODEL_VALIDATOR:-$SPECIALIST_MODEL_DEFAULT}
+    export AI_MODEL_ADDRESS=${AI_MODEL_ADDRESS:-$SPECIALIST_MODEL_DEFAULT}
+    export AI_MODEL_CLASSIFIER=${AI_MODEL_CLASSIFIER:-$SPECIALIST_MODEL_DEFAULT}
     export AI_MODEL_SUMMARIZER=${AI_MODEL_SUMMARIZER:-$SELECTED_MODEL}
     export COMPANIES_HOUSE_API_KEY=${COMPANIES_HOUSE_API_KEY:-}
     export OLLAMA_NUM_PARALLEL=$OLLAMA_NUM_PARALLEL
