@@ -125,6 +125,7 @@ ensure_ollama_running
 # 3. Smart Model Selection Logic
 # Model Sizes (Approximate):
 # llama3.1:8b (4.7GB) - Best for decent GPUs
+# mistral-small:24b (14GB) - Better quality for high-end multi-GPU hosts
 # llama3.2:1b (1.3GB) - Best for low VRAM/CPU/Low Disk
 # phi3:mini (2.2GB)   - Alternative for constrained envs
 
@@ -136,6 +137,10 @@ if [ "$AVAIL_DISK_GB" -lt 6 ]; then
     # Critical low space
     SELECTED_MODEL="llama3.2:1b"
     echo "[!] Critical Disk Space. Selecting tiny model: $SELECTED_MODEL"
+elif [ "$HAS_NVIDIA" = true ] && [ "$TOTAL_VRAM_MB" -gt 45000 ] && [ "$AVAIL_DISK_GB" -gt 20 ]; then
+    # High-end multi-GPU box with enough disk for a larger model.
+    SELECTED_MODEL="mistral-small:24b"
+    echo "[+] High-end GPU host detected. Selecting larger model: $SELECTED_MODEL"
 elif [ "$HAS_NVIDIA" = true ] && [ "$TOTAL_VRAM_MB" -gt 10000 ]; then
     # Good GPU (>=10GB VRAM)
     SELECTED_MODEL="llama3.1:8b"
@@ -213,11 +218,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Get Model Name from Environment (set by installer)
-AI_MODEL = os.getenv("AI_MODEL_NAME", "llama3.2:1b")
+AI_MODEL = os.getenv("AI_MODEL_NAME", "mistral-small:24b")
 # Task-specific local models. Default to AI_MODEL when not overridden so the
 # system works out of the box, but operators can point each specialist task at
-# a smaller/faster model (e.g. AI_MODEL_MATCHER=llama3.2:1b for entity match,
-# AI_MODEL_SUMMARIZER=llama3.1:8b for narrative output).
+# a smaller/faster model (e.g. AI_MODEL_MATCHER=llama3.1:8b for entity match,
+# AI_MODEL_SUMMARIZER=mistral-small:24b for narrative output).
 AI_MODEL_MATCHER = os.getenv("AI_MODEL_MATCHER", AI_MODEL)        # entity / name matching
 AI_MODEL_VALIDATOR = os.getenv("AI_MODEL_VALIDATOR", AI_MODEL)    # website-to-company validation
 AI_MODEL_ADDRESS = os.getenv("AI_MODEL_ADDRESS", AI_MODEL)        # address comparison / verification
@@ -239,7 +244,7 @@ Features:
 - **Overall summary** — cross-referenced B2B profile with Companies House priority, verified phones, domains_scanned
 - **Parallel processing** — concurrent AI inference, Companies House lookups, and page crawling
 """,
-    version="2.6.1"
+    version="2.7.0"
 )
 
 # --- Pydantic Models ---
@@ -1054,50 +1059,42 @@ def discover_business_urls(query: str, location: Optional[str], max_results: int
     if location:
         search_query = f"{search_query} {location.strip()}"
 
-    resp = requests.post(
-        "https://html.duckduckgo.com/html/",
-        data={"q": search_query},
-        timeout=20,
-        headers={"User-Agent": "Mozilla/5.0 (compatible; B2BEnricher/1.0)"},
-    )
-    resp.raise_for_status()
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-    candidates = []
-    seen_domains = set()
-
-    for link in soup.select("a.result__a"):
-        href = link.get("href", "")
-        real_url = parse_ddg_result_url(href)
-        if not real_url:
-            continue
-        domain = normalize_domain(real_url)
-        if not domain or domain in seen_domains:
-            continue
-        seen_domains.add(domain)
-        candidates.append({
-            "title": link.get_text(" ", strip=True),
-            "url": real_url,
-            "domain": domain,
-        })
-        if len(candidates) >= max_results:
-            break
-
-    return candidates
+    return search_public_results(search_query, max_results)
 
 
 def search_public_results(query: str, max_results: int) -> List[Dict[str, str]]:
-    resp = requests.post(
-        "https://html.duckduckgo.com/html/",
-        data={"q": query},
-        timeout=20,
-        headers={"User-Agent": "Mozilla/5.0 (compatible; B2BEnricher/1.0)"},
-    )
-    resp.raise_for_status()
+    """Search public web results, falling back across providers when one is
+    rate-limited or returns nothing. Currently: DuckDuckGo HTML → Yahoo HTML
+    redirects → Bing HTML.
+    """
+    results = _search_duckduckgo(query, max_results)
+    if not results:
+        results = _search_yahoo(query, max_results)
+    if not results:
+        results = _search_bing(query, max_results)
+    return results
+
+
+def _search_duckduckgo(query: str, max_results: int) -> List[Dict[str, str]]:
+    try:
+        resp = requests.post(
+            "https://html.duckduckgo.com/html/",
+            data={"q": query},
+            timeout=20,
+            headers={
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                              "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Accept-Language": "en-GB,en;q=0.9",
+            },
+        )
+        resp.raise_for_status()
+    except Exception as e:
+        logger.warning(f"DuckDuckGo search failed for '{query[:60]}': {e}")
+        return []
 
     soup = BeautifulSoup(resp.text, "html.parser")
-    results = []
-    seen = set()
+    results: List[Dict[str, str]] = []
+    seen: set = set()
     for link in soup.select("a.result__a"):
         href = link.get("href", "")
         real_url = parse_ddg_result_url(href)
@@ -1111,6 +1108,117 @@ def search_public_results(query: str, max_results: int) -> List[Dict[str, str]]:
             "title": link.get_text(" ", strip=True),
             "url": real_url,
             "domain": normalize_domain(real_url),
+        })
+        if len(results) >= max_results:
+            break
+    return results
+
+
+def _search_bing(query: str, max_results: int) -> List[Dict[str, str]]:
+    """Bing HTML fallback. Used when DDG is rate-limited or empty."""
+    try:
+        resp = requests.get(
+            "https://www.bing.com/search",
+            params={"q": query, "count": max(10, max_results)},
+            timeout=20,
+            headers={
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                              "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Accept-Language": "en-GB,en;q=0.9",
+            },
+        )
+        resp.raise_for_status()
+    except Exception as e:
+        logger.warning(f"Bing search failed for '{query[:60]}': {e}")
+        return []
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    results: List[Dict[str, str]] = []
+    seen: set = set()
+    # Bing wraps each organic hit in <li class="b_algo"> with an <h2><a href=...>.
+    for li in soup.select("li.b_algo"):
+        a = li.select_one("h2 a") or li.select_one("a")
+        if not a:
+            continue
+        href = a.get("href") or ""
+        if not href.startswith("http"):
+            continue
+        # Bing sometimes wraps URLs in a redirect; the visible href is usually direct.
+        key = href.lower().strip()
+        if key in seen:
+            continue
+        seen.add(key)
+        domain = normalize_domain(href)
+        if not domain:
+            continue
+        results.append({
+            "title": a.get_text(" ", strip=True),
+            "url": href,
+            "domain": domain,
+        })
+        if len(results) >= max_results:
+            break
+    return results
+
+
+def _parse_yahoo_result_url(raw_url: str) -> str:
+    if not raw_url:
+        return ""
+    match = re.search(r"/RU=([^/]+)/", raw_url)
+    if match:
+        return unquote(match.group(1))
+    return raw_url if raw_url.startswith("http") else ""
+
+
+def _search_yahoo(query: str, max_results: int) -> List[Dict[str, str]]:
+    """Yahoo HTML fallback.
+
+    Yahoo exposes organic results as redirect URLs containing `/RU=<encoded>`.
+    That works reliably on hosts where DDG/Bing strip all extractable anchors.
+    """
+    try:
+        resp = requests.get(
+            "https://search.yahoo.com/search",
+            params={"p": query},
+            timeout=20,
+            headers={
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                              "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Accept-Language": "en-GB,en;q=0.9",
+            },
+        )
+        resp.raise_for_status()
+    except Exception as e:
+        logger.warning(f"Yahoo search failed for '{query[:60]}': {e}")
+        return []
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    results: List[Dict[str, str]] = []
+    seen: set = set()
+    blocked_domains = {
+        "yahoo.com", "us.mail.yahoo.com", "finance.yahoo.com", "sports.yahoo.com",
+        "shopping.yahoo.com", "guce.yahoo.com", "help.yahoo.com",
+        "advertising.yahoo.com", "search.yahoo.com",
+    }
+
+    for a in soup.select("a[href]"):
+        href = a.get("href") or ""
+        if "r.search.yahoo.com" not in href:
+            continue
+        real_url = _parse_yahoo_result_url(href)
+        if not real_url:
+            continue
+        domain = normalize_domain(real_url)
+        if not domain or domain in blocked_domains or domain.endswith(".yahoo.com"):
+            continue
+        key = real_url.lower().strip()
+        if key in seen:
+            continue
+        seen.add(key)
+        results.append({
+            "title": a.get_text(" ", strip=True),
+            "url": real_url,
+            "domain": domain,
         })
         if len(results) >= max_results:
             break
@@ -1611,6 +1719,17 @@ def parse_address_fields(best_address_text: Optional[str], country_hint: Optiona
         fields["postcode"] = postcode_match.group(1).upper().strip()
 
     parts = [p.strip() for p in text.split(",") if p.strip()]
+    # Strip "Companies House default address" placeholder segments. Some CH
+    # records include "12345678 - COMPANIES HOUSE DEFAULT ADDRESS" as a comma
+    # part which would otherwise be treated as the city/region.
+    def _is_default_address_segment(seg: str) -> bool:
+        s = seg.strip().lower()
+        if "default address" in s or "companies house default" in s:
+            return True
+        if re.match(r"^\d{6,}\s*[-–]\s*", s):
+            return True
+        return False
+    parts = [p for p in parts if not _is_default_address_segment(p)]
     non_postcode_parts = [p for p in parts if not re.search(postcode_regex, p, flags=re.IGNORECASE)]
 
     known_countries = {
@@ -1743,6 +1862,7 @@ async def evaluate_business_address_request(request: VerifyBusinessAddressReques
 SOURCE_CONFIDENCE = {
     "companies_house": 95,
     "official_website": 80,
+    "user_query+libphonenumber": 80,  # phone supplied by user, validated offline
     "cross_referenced": 78,    # phone/address seen on 2+ independent sites
     "linkedin": 60,
     "yelp": 55,
@@ -1827,13 +1947,20 @@ def website_company_match_score(ch_record: Optional[Dict[str, Any]],
                                 website_domain: str,
                                 ai_data: Optional[Dict[str, Any]],
                                 contact_details: Optional[Dict[str, Any]],
-                                country_hint: Optional[str]) -> Dict[str, Any]:
+                                country_hint: Optional[str],
+                                query_phones: Optional[List[Dict[str, Any]]] = None,
+                                registered_office_is_proxy: bool = False) -> Dict[str, Any]:
     """Score how strongly a website appears to belong to a Companies House record.
 
     Combines: domain↔name token overlap, address presence on page, postcode
     co-occurrence, director surname mentions, company-number / "Registered in"
-    markers. Returns score 0-100, list of matched signals, mismatches, and the
-    raw evidence so the caller can attach it to provenance notes.
+    markers, and (when supplied) the presence of the user-supplied phone
+    number on the page. Returns score 0-100.
+
+    When ``registered_office_is_proxy`` is True the CH address is a shared
+    registered-office / PO Box (e.g. a formations agent), so postcode and
+    line-1 matches are NOT rewarded — those signals would otherwise promote
+    every business that uses the same registered office.
     """
     if not website_domain or not website_text:
         return {"score": 0, "matches": [], "mismatches": ["no_website_text"], "signals": {}}
@@ -1882,17 +2009,32 @@ def website_company_match_score(ch_record: Optional[Dict[str, Any]],
             page_postcodes.add(normalized_postcode(m.group(0)))
         signals["page_postcodes"] = sorted(page_postcodes)[:8]
 
-        if ch_pc and ch_pc in page_postcodes:
-            score += 25
-            matches.append("postcode_matches_companies_house")
-        elif ch_pc and page_postcodes:
-            mismatches.append(f"page_postcode_differs(ch={ch_pc},page={','.join(sorted(page_postcodes))[:60]})")
+        if registered_office_is_proxy:
+            signals["registered_office_is_proxy"] = True
+            mismatches.append("ch_address_is_proxy_skipped_for_scoring")
+        else:
+            if ch_pc and ch_pc in page_postcodes:
+                score += 25
+                matches.append("postcode_matches_companies_house")
+            elif ch_pc and page_postcodes:
+                mismatches.append(f"page_postcode_differs(ch={ch_pc},page={','.join(sorted(page_postcodes))[:60]})")
 
-        if ch_line1_slug:
-            slug_text = slugify_text(website_text[:20000])
-            if ch_line1_slug in slug_text:
-                score += 15
-                matches.append("address_line1_on_page")
+            if ch_line1_slug:
+                slug_text = slugify_text(website_text[:20000])
+                if ch_line1_slug in slug_text:
+                    score += 15
+                    matches.append("address_line1_on_page")
+
+    # 3.5) Query-phone presence — extremely strong signal when the user gave a
+    #      phone number and the page literally lists it.
+    if query_phones:
+        page_digits = re.sub(r"\D", "", website_text)
+        for variant in _phone_digit_variants(query_phones):
+            if variant and variant in page_digits:
+                score += 35
+                matches.append("query_phone_on_page")
+                signals["query_phone_match"] = variant
+                break
 
     # 4) Director surname mentions
     director_hits: List[str] = []
@@ -1940,9 +2082,175 @@ def website_company_match_score(ch_record: Optional[Dict[str, Any]],
     }
 
 
+# Domains that are never the company's official website. Used to filter
+# discovery results before scoring so junk pages cannot win by default.
+JUNK_WEBSITE_DOMAINS = {
+    "419scam.org", "joewein.net", "scamadviser.com", "scamwatch.gov.au",
+    "trustpilot.com", "scamguard.com",
+    "reverse-phone-lookup.com", "spokeo.com", "whitepages.com",
+    "searchyellowdirectory.com", "searchpeopledirectory.com",
+    "sync.me", "truecaller.com", "whocallsme.com", "whocalled.us",
+    "callercenter.com", "shouldianswer.com", "tellows.co.uk",
+    "mirror.co.uk", "thesun.co.uk", "dailymail.co.uk",
+    "bbc.co.uk", "bbc.com", "wikipedia.org",
+    "endole.co.uk", "checkcompany.co.uk", "companycheck.co.uk",
+    "opencorporates.com", "duedil.com", "dnb.com",
+    "find-and-update.company-information.service.gov.uk",
+    "yell.com", "thomsonlocal.com", "yelp.com", "yelp.co.uk",
+    "linkedin.com", "facebook.com", "twitter.com", "instagram.com",
+    "tiktok.com", "youtube.com", "google.com", "g.page", "maps.apple.com",
+}
+
+# A website candidate must beat this validator score (0-100) before we will
+# treat it as the company's likely official site. Anything weaker is reported
+# as "no validated website" rather than crowning a junk domain.
+WEBSITE_MIN_MATCH_SCORE = 30
+
+
+# Companies that provide registered-office / virtual-office / formations
+# services. They are real businesses, but they are NEVER the website of the
+# client company that registered through them. They will frequently match
+# (their site lists their PO Box / postcode and they hold mail for thousands
+# of CH companies), so they need their own filter.
+FORMATIONS_AGENT_DOMAINS = {
+    "identeco.co.uk",
+    "1stformations.co.uk",
+    "yourcompanyformations.co.uk",
+    "rapidformations.co.uk",
+    "duport.co.uk",
+    "your-virtual-office.co.uk",
+    "yourvirtualofficelondon.co.uk",
+    "thehoxtonmix.com",
+    "hoxton-mix.com",
+    "regus.com",
+    "icompanyformation.co.uk",
+    "madesimplegroup.com",
+    "companieshelp.co.uk",
+    "formationsdirect.com",
+    "quickformations.co.uk",
+    "newincorporations.co.uk",
+    "thecompanywarehouse.co.uk",
+    "yourcompanysetup.com",
+    "creativecompanyformations.co.uk",
+    "uniwide.co.uk",
+    "uniwidemail.co.uk",
+    "ukpostbox.com",
+    "mailboxesetc.co.uk",
+    "ukvirtualoffices.com",
+    "officeworld.co.uk",
+    "swiftformations.co.uk",
+    "formationswise.com",
+}
+
+
+def is_junk_website_domain(domain: str) -> bool:
+    if not domain:
+        return True
+    domain = domain.lower()
+    for junk in JUNK_WEBSITE_DOMAINS:
+        if domain == junk or domain.endswith("." + junk):
+            return True
+    # Heuristic junk markers in the host string.
+    if any(token in domain for token in ("scam", "419", "phonelookup", "reverse-phone")):
+        return True
+    return False
+
+
+def is_formations_agent_domain(domain: str) -> bool:
+    if not domain:
+        return False
+    domain = domain.lower()
+    for d in FORMATIONS_AGENT_DOMAINS:
+        if domain == d or domain.endswith("." + d):
+            return True
+    return False
+
+
+def is_companies_house_default_address(text: Optional[str]) -> bool:
+    """Detect Companies House 'default'/proxy registered-office strings such as
+    '12345678 - COMPANIES HOUSE DEFAULT ADDRESS' or 'PO Box 4385'. Such an
+    address is NOT a unique business location, so postcode/line1 matches on a
+    third-party site should not be rewarded.
+    """
+    if not text:
+        return False
+    t = str(text).lower()
+    if "default address" in t or "companies house default" in t:
+        return True
+    if re.search(r"\bpo\s*box\s*\d+", t):
+        return True
+    return False
+
+
+def extract_query_phones(query: str, country_hint: Optional[str]) -> List[Dict[str, Any]]:
+    """Pull phone numbers out of a free-text query (e.g. when the user pastes a
+    company name + phone). Uses libphonenumber's matcher so we accept the
+    user's exact format and emit normalized variants.
+    """
+    if not query:
+        return []
+    region = (country_hint or "GB").strip().upper()
+    region_map = {"UK": "GB", "UNITED KINGDOM": "GB", "ENGLAND": "GB",
+                  "SCOTLAND": "GB", "WALES": "GB", "NORTHERN IRELAND": "GB",
+                  "USA": "US", "US": "US"}
+    region = region_map.get(region, region)
+    if len(region) != 2:
+        region = "GB"
+
+    found: List[Dict[str, Any]] = []
+    seen: set = set()
+    try:
+        for m in phonenumbers.PhoneNumberMatcher(query, region):
+            num = m.number
+            if not phonenumbers.is_possible_number(num):
+                continue
+            e164 = phonenumbers.format_number(num, phonenumbers.PhoneNumberFormat.E164)
+            if e164 in seen:
+                continue
+            seen.add(e164)
+            found.append({
+                "e164": e164,
+                "international": phonenumbers.format_number(num, phonenumbers.PhoneNumberFormat.INTERNATIONAL),
+                "national": phonenumbers.format_number(num, phonenumbers.PhoneNumberFormat.NATIONAL),
+                "is_valid": phonenumbers.is_valid_number(num),
+            })
+    except Exception as e:
+        logger.warning(f"extract_query_phones failed: {e}")
+    return found
+
+
+def strip_phones_from_text(text: str) -> str:
+    """Remove phone-like substrings from a free-text query so a name-only
+    search doesn't get polluted by the digits."""
+    if not text:
+        return ""
+    cleaned = re.sub(r"\+?\d[\d\s().\-]{6,}\d", " ", text)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _phone_digit_variants(query_phones: List[Dict[str, Any]]) -> List[str]:
+    """Produce digit-only forms (with and without country code) used to detect
+    a query phone inside arbitrary HTML."""
+    out: List[str] = []
+    for ph in query_phones or []:
+        for key in ("e164", "national", "international"):
+            digits = re.sub(r"\D", "", str(ph.get(key) or ""))
+            if digits and len(digits) >= 9 and digits not in out:
+                out.append(digits)
+        # GB national without leading 0 (in case the page strips it)
+        nat = re.sub(r"\D", "", str(ph.get("national") or ""))
+        if nat.startswith("0") and len(nat) >= 10:
+            trimmed = nat[1:]
+            if trimmed not in out:
+                out.append(trimmed)
+    return out
+
+
 def pick_likely_website(results: List[Dict[str, Any]],
                         ch_record: Optional[Dict[str, Any]],
-                        country_hint: Optional[str]) -> Dict[str, Any]:
+                        country_hint: Optional[str],
+                        query_phones: Optional[List[Dict[str, Any]]] = None,
+                        registered_office_is_proxy: bool = False) -> Dict[str, Any]:
     """Select the most likely live company website from enrichment results.
 
     Skips aggregator/directory pages, scores each non-aggregator candidate by
@@ -1957,7 +2265,7 @@ def pick_likely_website(results: List[Dict[str, Any]],
         if item.get("is_aggregator"):
             continue
         domain = item.get("domain") or ""
-        if not domain:
+        if not domain or is_junk_website_domain(domain) or is_formations_agent_domain(domain):
             continue
         # Re-fetch the page text once to score address/name presence.
         text = clean_text_from_url(item.get("url") or f"https://{domain}") or ""
@@ -1968,6 +2276,8 @@ def pick_likely_website(results: List[Dict[str, Any]],
             item.get("enrichment") or {},
             item.get("contact_details") or {},
             country_hint,
+            query_phones=query_phones,
+            registered_office_is_proxy=registered_office_is_proxy,
         )
         ai_conf = int(((item.get("confidence") or {}).get("overall")) or 0)
         # Composite: weight the validator score heavily, with AI confidence as tiebreaker.
@@ -1988,7 +2298,242 @@ def pick_likely_website(results: List[Dict[str, Any]],
         return {"selected": None, "candidates": []}
 
     candidates.sort(key=lambda c: (c["composite_score"], c["match_score"], c["ai_confidence"]), reverse=True)
-    return {"selected": candidates[0], "candidates": candidates}
+    best = candidates[0]
+    if int(best.get("match_score") or 0) < WEBSITE_MIN_MATCH_SCORE:
+        # No candidate is convincing. Return the ranked list for transparency
+        # but do not crown a winner.
+        return {"selected": None, "candidates": candidates}
+    return {"selected": best, "candidates": candidates}
+
+
+def find_official_website(ch_record: Dict[str, Any],
+                          country_hint: Optional[str],
+                          max_candidates: int = 8,
+                          query_phones: Optional[List[Dict[str, Any]]] = None,
+                          registered_office_is_proxy: bool = False) -> Dict[str, Any]:
+    """Run a clean, name-only DuckDuckGo search to find the company's official
+    website once we have a Companies House legal name. This avoids contamination
+    from noisy original queries (e.g. those including phone numbers).
+    """
+    if not ch_record:
+        return {"selected": None, "candidates": []}
+
+    legal_name = str(ch_record.get("matched_company_name") or "").strip()
+    if not legal_name:
+        return {"selected": None, "candidates": []}
+
+    # Strip the corporate suffix to broaden the search a little.
+    short_name = re.sub(r"\b(limited|ltd|plc|llp|llc|inc)\.?\b", "", legal_name, flags=re.IGNORECASE).strip()
+
+    queries = [
+        f'"{legal_name}" official site',
+        f'"{legal_name}" contact',
+        f'"{legal_name}"',
+    ]
+    if short_name and short_name.lower() != legal_name.lower():
+        queries.append(f'"{short_name}" official site')
+    if country_hint:
+        queries.insert(0, f'"{legal_name}" {country_hint}')
+
+    seen: Dict[str, Dict[str, str]] = {}
+    for q in queries:
+        try:
+            for hit in search_public_results(q, max_candidates):
+                domain = hit.get("domain") or ""
+                if not domain or domain in seen:
+                    continue
+                if is_junk_website_domain(domain) or is_formations_agent_domain(domain):
+                    continue
+                # Skip well-known aggregator domains using the same list as the crawler.
+                aggregator_markers = ("linkedin.com", "facebook.com", "twitter.com",
+                                      "yelp.com", "yell.com", "google.com",
+                                      "find-and-update.company-information.service.gov.uk")
+                if any(m in domain for m in aggregator_markers):
+                    continue
+                seen[domain] = hit
+                if len(seen) >= max_candidates:
+                    break
+        except Exception as e:
+            logger.warning(f"Official-site search failed for '{q}': {e}")
+        if len(seen) >= max_candidates:
+            break
+
+    candidates: List[Dict[str, Any]] = []
+    for domain, hit in seen.items():
+        url = hit.get("url") or f"https://{domain}"
+        text = clean_text_from_url(url) or ""
+        match = website_company_match_score(
+            ch_record, text, domain, None, None, country_hint,
+            query_phones=query_phones,
+            registered_office_is_proxy=registered_office_is_proxy,
+        )
+        candidates.append({
+            "domain": domain,
+            "url": url,
+            "title": hit.get("title"),
+            "match_score": match["score"],
+            "composite_score": match["score"],
+            "matches": match["matches"],
+            "mismatches": match["mismatches"],
+            "signals": match["signals"],
+            "ai_confidence": 0,
+        })
+
+    if not candidates:
+        return {"selected": None, "candidates": []}
+
+    candidates.sort(key=lambda c: (c["match_score"],), reverse=True)
+    best = candidates[0]
+    if int(best.get("match_score") or 0) < WEBSITE_MIN_MATCH_SCORE:
+        return {"selected": None, "candidates": candidates}
+    return {"selected": best, "candidates": candidates}
+
+
+def find_website_by_phone(query_phones: List[Dict[str, Any]],
+                          ch_record: Optional[Dict[str, Any]],
+                          country_hint: Optional[str],
+                          max_candidates: int = 10,
+                          registered_office_is_proxy: bool = False) -> Dict[str, Any]:
+    """Use the user-supplied phone number as a discovery anchor.
+
+    A site that publishes the company's own phone number is overwhelmingly
+    likely to BE that company's site. This bypasses both the noisy original
+    query and the often-shared Companies House registered office.
+    """
+    if not query_phones:
+        return {"selected": None, "candidates": []}
+
+    legal_name = str((ch_record or {}).get("matched_company_name") or "").strip()
+
+    queries: List[str] = []
+    for ph in query_phones:
+        nat = ph.get("national")
+        intl = ph.get("international")
+        if nat:
+            # Combined name + phone is the strongest disambiguator when we
+            # have a CH legal name; quoted phone alone is the fallback.
+            if legal_name:
+                queries.append(f'"{legal_name}" "{nat}"')
+                queries.append(f'"{nat}" contact')
+            queries.append(f'"{nat}"')
+        if intl:
+            if legal_name:
+                queries.append(f'"{legal_name}" "{intl}"')
+            queries.append(f'"{intl}"')
+
+    # Deduplicate while preserving order.
+    seen_q: set = set()
+    queries = [q for q in queries if not (q in seen_q or seen_q.add(q))]
+
+    aggregator_markers = (
+        "linkedin.com", "facebook.com", "twitter.com", "instagram.com",
+        "yelp.com", "yell.com", "google.com", "g.page",
+        "find-and-update.company-information.service.gov.uk",
+        "scamadviser", "reverse-phone", "phonelookup", "whocalled",
+        "tellows", "shouldianswer", "spokeo", "whitepages",
+        "searchyellowdirectory", "searchpeopledirectory",
+        "419scam", "qrius.com", "bing.com", "msn.com",
+    )
+    # E-commerce / shopping domains accidentally match phone-shaped digit
+    # strings (SKUs, product IDs). Reject so they cannot dominate.
+    shopping_markers = (
+        "amazon.", "walmart.com", "ebay.", "etsy.com", "aliexpress.",
+        "yami.com", "jomashop.com", "lyko.com", "dermstore.com",
+        "elementvapor.com", "nin-nin-game.com", "wayfair.", "target.com",
+        "homedepot.com", "bestbuy.com", "argos.co.uk", "currys.co.uk",
+        "shopify.com",
+    )
+
+    seen: Dict[str, Dict[str, str]] = {}
+    # Cap per-query results so one noisy query can't flood the pool.
+    per_query_cap = max(3, max_candidates // 2)
+    for q in queries[:8]:
+        try:
+            for hit in search_public_results(q, per_query_cap):
+                domain = (hit.get("domain") or "").lower()
+                if not domain or domain in seen:
+                    continue
+                if is_junk_website_domain(domain) or is_formations_agent_domain(domain):
+                    continue
+                if any(m in domain for m in aggregator_markers):
+                    continue
+                if any(m in domain for m in shopping_markers):
+                    continue
+                seen[domain] = hit
+                if len(seen) >= max_candidates:
+                    break
+        except Exception as e:
+            logger.warning(f"Phone-based search failed for '{q}': {e}")
+        if len(seen) >= max_candidates:
+            break
+
+    candidates: List[Dict[str, Any]] = []
+    digit_variants = _phone_digit_variants(query_phones)
+    for domain, hit in seen.items():
+        url = hit.get("url") or f"https://{domain}"
+        text = clean_text_from_url(url) or ""
+        # Also pull the raw HTML stripped of tags so footer phone numbers
+        # (which trafilatura strips out) are still visible to the scorer.
+        try:
+            raw_html = fetch_html_from_url(url) or ""
+            raw_text = html_to_text(raw_html) if raw_html else ""
+            if raw_text and raw_text not in text:
+                text = (text + "\n" + raw_text)[:80000]
+        except Exception:
+            pass
+        # If the chosen page doesn't already contain the phone digits, also
+        # peek at common contact pages — companies often list their phone on
+        # /contact rather than the URL DuckDuckGo surfaced.
+        page_digits = re.sub(r"\D", "", text)
+        has_phone = any(v and v in page_digits for v in digit_variants)
+        if not has_phone:
+            for path in ("/contact", "/contact-us", "/about", "/about-us"):
+                try:
+                    extra_url = f"https://{domain}{path}"
+                    extra_html = fetch_html_from_url(extra_url) or ""
+                    if not extra_html:
+                        continue
+                    extra_text = html_to_text(extra_html)
+                    if extra_text:
+                        text = (text + "\n" + extra_text)[:80000]
+                        if any(v and v in re.sub(r"\D", "", extra_text) for v in digit_variants):
+                            has_phone = True
+                            break
+                except Exception:
+                    continue
+        match = website_company_match_score(
+            ch_record, text, domain, None, None, country_hint,
+            query_phones=query_phones,
+            registered_office_is_proxy=registered_office_is_proxy,
+        )
+        candidates.append({
+            "domain": domain,
+            "url": url,
+            "title": hit.get("title"),
+            "match_score": match["score"],
+            "composite_score": match["score"],
+            "matches": match["matches"],
+            "mismatches": match["mismatches"],
+            "signals": match["signals"],
+            "ai_confidence": 0,
+        })
+
+    if not candidates:
+        return {"selected": None, "candidates": []}
+
+    # Heavily prefer pages that literally contain the phone number.
+    candidates.sort(
+        key=lambda c: (
+            1 if "query_phone_on_page" in (c.get("matches") or []) else 0,
+            c.get("match_score") or 0,
+        ),
+        reverse=True,
+    )
+    best = candidates[0]
+    if int(best.get("match_score") or 0) < WEBSITE_MIN_MATCH_SCORE:
+        return {"selected": None, "candidates": candidates}
+    return {"selected": best, "candidates": candidates}
+
 
 
 def build_ai_business_summary_prompt(record: Dict[str, Any]) -> str:
@@ -2042,6 +2587,200 @@ async def run_ai_business_summary(record: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+# =============================================================================
+# Active email discovery
+#
+# Crawls common contact/about/privacy/legal pages on the chosen company domain
+# plus a handful of public sources, de-obfuscates encoded addresses, filters
+# noise, classifies each email by role, and validates MX records so the caller
+# can attach per-email provenance and confidence.
+# =============================================================================
+
+EMAIL_NOISE_LOCAL_PARTS = {
+    "example", "test", "user", "username", "your", "yourname", "email",
+    "name", "firstname", "lastname", "someone", "sample", "noreply",
+    "no-reply", "do-not-reply", "donotreply", "wordpress", "sentry",
+}
+
+EMAIL_NOISE_DOMAINS = {
+    "example.com", "example.org", "example.net", "test.com", "domain.com",
+    "yourdomain.com", "email.com", "sentry.io", "sentry-cdn.com",
+    "wordpress.com", "wixpress.com", "squarespace.com", "cloudflare.com",
+    "googleusercontent.com", "gstatic.com", "w3.org", "schema.org",
+    "placeholder.com",
+}
+
+ROLE_EMAIL_PREFIXES = {
+    "info", "contact", "enquiries", "enquiry", "hello", "admin",
+    "office", "accounts", "billing", "finance", "sales", "support",
+    "help", "service", "careers", "jobs", "hr", "recruitment",
+    "press", "media", "marketing", "privacy", "legal", "dpo",
+    "compliance", "orders", "bookings",
+}
+
+EMAIL_SOURCE_PATHS = [
+    "/", "/contact", "/contact-us", "/contact/", "/get-in-touch",
+    "/about", "/about-us", "/about/", "/team", "/our-team", "/staff",
+    "/people", "/leadership", "/management",
+    "/privacy", "/privacy-policy", "/legal", "/impressum", "/terms",
+    "/help", "/support", "/customer-service",
+]
+
+
+def classify_email(email: str, site_domain: str) -> Dict[str, Any]:
+    """Return {role, is_role_account, is_personal, is_official_domain} for an email."""
+    email = email.strip().lower()
+    local = email.split("@", 1)[0] if "@" in email else ""
+    domain = email.split("@", 1)[1] if "@" in email else ""
+    is_role = local in ROLE_EMAIL_PREFIXES
+    role = local if is_role else None
+    is_official = bool(site_domain and (domain == site_domain or domain.endswith("." + site_domain)))
+    return {
+        "role": role,
+        "is_role_account": is_role,
+        "is_personal": not is_role and "@" in email,
+        "is_official_domain": is_official,
+        "domain": domain,
+    }
+
+
+def _clean_email_candidate(raw: str) -> Optional[str]:
+    """Normalise an email; return None if obviously invalid/noise."""
+    if not raw:
+        return None
+    email = raw.strip().lower().strip(".,;:<>()[]{}\"'`")
+    if "@" not in email or email.count("@") != 1:
+        return None
+    local, _, domain = email.partition("@")
+    if not local or not domain or "." not in domain:
+        return None
+    if any(ch.isspace() for ch in email):
+        return None
+    # Strip common noise / placeholder patterns.
+    if local in EMAIL_NOISE_LOCAL_PARTS:
+        return None
+    if domain in EMAIL_NOISE_DOMAINS:
+        return None
+    # Reject file-like locals (image hashes, css sprites mislabelled as emails).
+    if re.fullmatch(r"[a-f0-9]{16,}", local):
+        return None
+    # Reject values that look like filenames (e.g. logo-v2@2x.png was parsed as email).
+    if any(domain.endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp")):
+        return None
+    if len(email) > 120:
+        return None
+    return email
+
+
+def _decode_obfuscated_emails(html: str) -> List[str]:
+    """Extract emails from common obfuscation patterns on websites."""
+    if not html:
+        return []
+    found: List[str] = []
+    # 1) mailto: links (may be HTML-entity encoded).
+    for m in re.finditer(r"mailto:([^\"'?>\s]+)", html, flags=re.IGNORECASE):
+        raw = m.group(1)
+        # Decode HTML entities and URL encoding.
+        raw = raw.replace("&#64;", "@").replace("%40", "@")
+        raw = re.sub(r"&#(\d+);", lambda mm: chr(int(mm.group(1))), raw)
+        found.append(raw)
+    # 2) Plain-text emails.
+    for m in re.finditer(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", html):
+        found.append(m.group(0))
+    # 3) "name [at] domain [dot] com" style.
+    patt = re.compile(
+        r"([A-Za-z0-9._%+\-]+)\s*(?:\[at\]|\(at\)|\{at\}|\s+at\s+)\s*([A-Za-z0-9.\-]+)\s*(?:\[dot\]|\(dot\)|\{dot\}|\s+dot\s+)\s*([A-Za-z]{2,})",
+        flags=re.IGNORECASE,
+    )
+    for m in patt.finditer(html):
+        found.append(f"{m.group(1)}@{m.group(2)}.{m.group(3)}")
+    return found
+
+
+def discover_company_emails(site_domain: str,
+                            extra_urls: Optional[List[str]] = None,
+                            country_hint: Optional[str] = None,
+                            max_pages: int = 10) -> Dict[str, Any]:
+    """Crawl likely contact pages on the company's own domain and de-obfuscate
+    emails found there. Returns structured per-email metadata plus source pages
+    and an MX validation flag for the domain.
+    """
+    if not site_domain:
+        return {"emails": [], "pages_crawled": [], "mx_valid": False}
+
+    site_domain = site_domain.lower().strip()
+    base_url = f"https://{site_domain}"
+    urls: List[str] = [f"{base_url}{path}" for path in EMAIL_SOURCE_PATHS]
+    # Also follow in-site links from the homepage (contact/about/legal).
+    home_html = fetch_html_from_url(base_url)
+    if home_html:
+        for link in extract_relevant_site_links(base_url, home_html, max_links=12):
+            if link not in urls:
+                urls.append(link)
+    if extra_urls:
+        for u in extra_urls:
+            if u and u not in urls:
+                urls.append(u)
+
+    urls = urls[:max_pages * 2]  # hard cap
+    found_emails: Dict[str, Dict[str, Any]] = {}
+    pages_crawled: List[str] = []
+
+    def process_url(url: str) -> Dict[str, Any]:
+        html = fetch_html_from_url(url)
+        if not html:
+            return {"url": url, "emails": []}
+        raw_emails = _decode_obfuscated_emails(html)
+        return {"url": url, "emails": raw_emails}
+
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(urls)))) as executor:
+        futures = [executor.submit(process_url, u) for u in urls]
+        for fut in as_completed(futures):
+            try:
+                r = fut.result()
+            except Exception:
+                continue
+            if not r.get("emails"):
+                continue
+            pages_crawled.append(r["url"])
+            for raw in r["emails"]:
+                email = _clean_email_candidate(raw)
+                if not email:
+                    continue
+                if email not in found_emails:
+                    meta = classify_email(email, site_domain)
+                    meta["email"] = email
+                    meta["sources"] = []
+                    found_emails[email] = meta
+                if r["url"] not in found_emails[email]["sources"]:
+                    found_emails[email]["sources"].append(r["url"])
+            if len(pages_crawled) >= max_pages:
+                break
+
+    mx_valid = bool(get_mx_records(site_domain))
+
+    # Rank: official-domain + role accounts first, then personal on-domain,
+    # then anything else. Within a tier, more source pages wins.
+    def sort_key(meta: Dict[str, Any]):
+        tier = 0
+        if meta["is_official_domain"] and meta["is_role_account"]:
+            tier = 3
+        elif meta["is_official_domain"]:
+            tier = 2
+        elif meta["is_role_account"]:
+            tier = 1
+        return (tier, len(meta.get("sources", [])))
+
+    ranked = sorted(found_emails.values(), key=sort_key, reverse=True)
+
+    return {
+        "emails": ranked,
+        "pages_crawled": pages_crawled[:max_pages],
+        "mx_valid": mx_valid,
+        "domain": site_domain,
+    }
+
+
 async def build_verified_b2b_record(query: str,
                                     location: Optional[str],
                                     results: List[Dict[str, Any]],
@@ -2077,6 +2816,7 @@ async def build_verified_b2b_record(query: str,
         "industry": None,
         "phones": None,
         "emails": None,
+        "email_details": None,
         "social_links": None,
         "field_confidence": {},
         "field_sources": {},
@@ -2157,15 +2897,85 @@ async def build_verified_b2b_record(query: str,
             notes=["no Companies House match; derived from website/AI"]))
 
     # ---- 3) Likely website via dedicated validator ----
+    # Pull any phone numbers out of the user's free-text query first; these are
+    # one of the strongest discovery signals we have because the company's own
+    # site will publish its phone, but a registered-office agent / scam list
+    # generally won't.
+    query_phones = extract_query_phones(query, location)
+
+    # Detect "default" / shared registered office addresses so we don't reward
+    # third parties (formations agents, virtual offices) that happen to use
+    # the same postcode.
+    ch_addr_text_for_proxy = (record.get("registered_address") or {}).get("value") or ""
+    if not ch_addr_text_for_proxy and ch_primary:
+        ch_addr_text_for_proxy = format_registered_office_address(
+            ch_primary.get("registered_office_address")) or ""
+    registered_office_is_proxy = is_companies_house_default_address(ch_addr_text_for_proxy)
+    if registered_office_is_proxy:
+        record["validation_notes"].append(
+            "Companies House registered office is a shared/default address — "
+            "postcode/line-1 matches will not score websites")
+
+    # Pass 1: score the URLs that the original discovery already crawled.
     website_choice = await asyncio.get_event_loop().run_in_executor(
-        None, pick_likely_website, results, ch_primary, location,
+        None, lambda: pick_likely_website(
+            results, ch_primary, location,
+            query_phones=query_phones,
+            registered_office_is_proxy=registered_office_is_proxy,
+        ),
     )
     selected_site = website_choice.get("selected")
+
+    # Pass 2: if Companies House gave us a clean legal name, run a focused
+    # search using just that name. Original queries can include phone numbers,
+    # SIC keywords, etc., which often surface phone-lookup or scam-list pages.
+    fresh_choice: Dict[str, Any] = {"selected": None, "candidates": []}
+    if ch_primary:
+        fresh_choice = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: find_official_website(
+                ch_primary, location, 8,
+                query_phones=query_phones,
+                registered_office_is_proxy=registered_office_is_proxy,
+            ),
+        )
+        fresh_best = fresh_choice.get("selected")
+        if fresh_best and (
+            not selected_site
+            or int(fresh_best.get("match_score") or 0) > int((selected_site or {}).get("match_score") or 0)
+        ):
+            selected_site = fresh_best
+            website_choice = fresh_choice
+
+    # Pass 3: if the user gave us a phone number, search for that exact phone.
+    # Whichever site lists it is overwhelmingly likely to be the real one.
+    phone_choice: Dict[str, Any] = {"selected": None, "candidates": []}
+    if query_phones:
+        phone_choice = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: find_website_by_phone(
+                query_phones, ch_primary, location, 10,
+                registered_office_is_proxy=registered_office_is_proxy,
+            ),
+        )
+        phone_best = phone_choice.get("selected")
+        if phone_best:
+            phone_score = int(phone_best.get("match_score") or 0)
+            current_score = int((selected_site or {}).get("match_score") or 0)
+            phone_confirmed = "query_phone_on_page" in (phone_best.get("matches") or [])
+            # A phone-confirmed page wins ties and beats anything within 20 points.
+            if not selected_site or phone_score > current_score or (phone_confirmed and phone_score + 20 >= current_score):
+                selected_site = phone_best
+                website_choice = phone_choice
+
     if selected_site:
         match_score = int(selected_site.get("match_score") or 0)
+        phone_confirmed = "query_phone_on_page" in (selected_site.get("matches") or [])
         # Confidence: validator score blended with source authority (official_website).
         conf = int(SOURCE_CONFIDENCE["official_website"] * 0.5 + match_score * 0.5)
+        if phone_confirmed:
+            conf = min(99, conf + 10)
         notes = [f"validator score {match_score}/100"]
+        if phone_confirmed:
+            notes.append("query phone number found on page")
         if selected_site.get("matches"):
             notes.append("matches: " + ", ".join(selected_site["matches"][:5]))
         if selected_site.get("mismatches"):
@@ -2173,18 +2983,30 @@ async def build_verified_b2b_record(query: str,
             for warn in selected_site["mismatches"]:
                 record["mismatch_warnings"].append(f"website:{selected_site['domain']}: {warn}")
         alternatives = [
-            {"domain": c["domain"], "match_score": c["match_score"], "composite_score": c["composite_score"]}
+            {"domain": c["domain"], "match_score": c["match_score"], "composite_score": c.get("composite_score", c["match_score"])}
             for c in website_choice.get("candidates", [])[1:4]
         ]
         site_url = f"https://{selected_site['domain']}"
+        # A phone-confirmed match always counts as the official website.
+        is_official = phone_confirmed or match_score >= 50
         set_field("likely_website", field_record(
-            site_url, "official_website" if match_score >= 50 else "discovery",
+            site_url, "official_website" if is_official else "discovery",
             conf, alternatives=alternatives, notes=notes))
-    elif overall_summary.get("website"):
-        set_field("likely_website", field_record(
-            overall_summary["website"], "discovery",
-            SOURCE_CONFIDENCE["discovery"],
-            notes=["no validator match; chose top non-aggregator from discovery"]))
+    else:
+        # No website passed validation. Surface ranked candidates as alternatives
+        # but do not crown a winner; this prevents junk pages from being picked.
+        ranked = ((website_choice.get("candidates") or [])
+                  + (fresh_choice.get("candidates") or [])
+                  + (phone_choice.get("candidates") or []))
+        alt = [
+            {"domain": c["domain"], "match_score": c["match_score"]}
+            for c in ranked[:4]
+        ]
+        record["validation_notes"].append(
+            "No website passed minimum match score; not surfacing a likely_website")
+        if alt:
+            record["mismatch_warnings"].append(
+                f"website: best candidate scored {alt[0]['match_score']}/100 (below threshold {WEBSITE_MIN_MATCH_SCORE})")
 
     # ---- 4) Verified address: cross-check CH against summary/web evidence ----
     summary_addr = overall_summary.get("verified_address") or overall_summary.get("address")
@@ -2240,32 +3062,114 @@ async def build_verified_b2b_record(query: str,
         if any(bool(v) for v in verified_fields.values()):
             record["verified_address_fields"] = verified_fields
 
-    # ---- 5) Phones: only verified ones from overall_summary survive ----
-    verified_phones = list(overall_summary.get("phones") or [])
-    if verified_phones:
+    # ---- 5) Phones: prefer the user-supplied phone (validated), then any
+    #         cross-referenced phones from the discovery pass.
+    user_phones: List[str] = []
+    for ph in (query_phones or []):
+        if ph.get("is_valid") and ph.get("international") and ph["international"] not in user_phones:
+            user_phones.append(ph["international"])
+    discovered_phones = list(overall_summary.get("phones") or [])
+    if user_phones:
+        # User phone is canonical; surface other discovered phones as alternatives.
+        alts = [p for p in discovered_phones if p not in user_phones]
+        notes = ["validated by libphonenumber from user query"]
+        site_matches = (selected_site.get("matches") if selected_site else []) or []
+        if "query_phone_on_page" in site_matches:
+            notes.append("confirmed on the company's website")
+            conf = SOURCE_CONFIDENCE["official_website"]
+        else:
+            conf = SOURCE_CONFIDENCE["cross_referenced"]
         set_field("phones", field_record(
-            verified_phones, "cross_referenced",
+            user_phones, "user_query+libphonenumber", conf,
+            alternatives=alts, notes=notes))
+    elif discovered_phones:
+        set_field("phones", field_record(
+            discovered_phones, "cross_referenced",
             SOURCE_CONFIDENCE["cross_referenced"],
             notes=["validated by libphonenumber and seen on official site or 2+ sources"]))
 
-    # ---- 6) Emails ----
-    emails = list(overall_summary.get("emails") or [])
-    if emails:
-        # Only treat as official if the email domain matches the chosen website.
-        site_value = (record.get("likely_website") or {}).get("value") or ""
-        site_domain = normalize_domain(site_value) if site_value else ""
-        official_emails = [e for e in emails if site_domain and e.lower().endswith("@" + site_domain)]
-        if official_emails:
+    # ---- 6) Emails: only run when we have a validated official website ----
+    # Without a trusted website we cannot tell whether a scraped email belongs
+    # to the company. Emitting random emails here led to nonsense results.
+    likely = record.get("likely_website") or {}
+    site_value = likely.get("value") or ""
+    site_source = likely.get("source") or ""
+    site_domain = normalize_domain(site_value) if site_value else ""
+
+    if site_domain and site_source == "official_website" and not is_junk_website_domain(site_domain):
+        try:
+            discovery = await asyncio.get_event_loop().run_in_executor(
+                None, discover_company_emails, site_domain, None, location, 10,
+            )
+        except Exception as e:
+            logger.warning(f"Email discovery failed for {site_domain}: {e}")
+            discovery = {"emails": [], "pages_crawled": [], "mx_valid": False, "domain": site_domain}
+
+        # Merge prior emails from the initial enrichment pass, but only keep
+        # those that match the official domain. This drops random emails
+        # scraped from directory / scam-list pages.
+        merged: Dict[str, Dict[str, Any]] = {}
+        for meta in discovery.get("emails") or []:
+            if meta.get("is_official_domain"):
+                merged[meta["email"]] = meta
+
+        for raw in (overall_summary.get("emails") or []):
+            cleaned = _clean_email_candidate(raw) if raw else None
+            if not cleaned or cleaned in merged:
+                continue
+            meta = classify_email(cleaned, site_domain)
+            if not meta.get("is_official_domain"):
+                continue
+            meta.update({"email": cleaned, "sources": ["initial_crawl"]})
+            merged[cleaned] = meta
+
+        email_list = list(merged.values())
+        if email_list:
+            primary = [m["email"] for m in email_list]
+            base_conf = SOURCE_CONFIDENCE["official_website"]
+            notes = [
+                f"{len(email_list)} email(s) on domain {site_domain}",
+                f"MX valid: {discovery.get('mx_valid')}",
+            ]
+            if discovery.get("pages_crawled"):
+                notes.append(f"crawled: {', '.join(discovery['pages_crawled'][:4])}")
+            if discovery.get("mx_valid"):
+                base_conf = min(99, base_conf + 5)
+
             set_field("emails", field_record(
-                official_emails, "official_website",
-                SOURCE_CONFIDENCE["official_website"],
-                alternatives=[e for e in emails if e not in official_emails],
-                notes=["email domain matches likely_website"]))
+                primary, "official_website", base_conf,
+                alternatives=[],
+                notes=notes,
+            ))
+            record["email_details"] = {
+                "domain": site_domain,
+                "mx_valid": discovery.get("mx_valid"),
+                "pages_crawled": discovery.get("pages_crawled"),
+                "entries": [
+                    {
+                        "email": m["email"],
+                        "role": m.get("role"),
+                        "is_role_account": m.get("is_role_account"),
+                        "is_personal": m.get("is_personal"),
+                        "is_official_domain": m.get("is_official_domain"),
+                        "sources": m.get("sources") or [],
+                    }
+                    for m in email_list
+                ],
+            }
         else:
-            set_field("emails", field_record(
-                emails, "discovery",
-                SOURCE_CONFIDENCE["discovery"],
-                notes=["email domain does not match likely_website; treat as low-confidence"]))
+            record["email_details"] = {
+                "domain": site_domain,
+                "mx_valid": discovery.get("mx_valid"),
+                "pages_crawled": discovery.get("pages_crawled"),
+                "entries": [],
+            }
+            record["validation_notes"].append(
+                f"No emails found on official website {site_domain}")
+    else:
+        # No validated official website → don't surface emails at all.
+        record["validation_notes"].append(
+            "Email discovery skipped: no validated official website")
 
     # ---- 7) Industry / sector via AI on best result ----
     best_ai = None
