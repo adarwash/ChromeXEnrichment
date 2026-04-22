@@ -58,9 +58,14 @@ if command -v nvidia-smi &> /dev/null; then
         OLLAMA_MAX_LOADED_MODELS=$GPU_COUNT
         MULTI_GPU_MODE="enabled (${GPU_COUNT} GPUs)"
         echo "[+] Multi-GPU mode enabled. Ollama will spread workloads across ${GPU_COUNT} GPUs."
+    elif [ "$TOTAL_VRAM_MB" -gt 60000 ]; then
+        OLLAMA_NUM_PARALLEL=6
+        OLLAMA_MAX_LOADED_MODELS=3
+        echo "[+] Very-high-VRAM single GPU (>60GB). Setting OLLAMA_NUM_PARALLEL=6 + MAX_LOADED_MODELS=3 for max concurrent inference."
     elif [ "$TOTAL_VRAM_MB" -gt 20000 ]; then
-        OLLAMA_NUM_PARALLEL=3
-        echo "[+] High-VRAM single GPU. Setting OLLAMA_NUM_PARALLEL=3 for faster concurrent inference."
+        OLLAMA_NUM_PARALLEL=4
+        OLLAMA_MAX_LOADED_MODELS=2
+        echo "[+] High-VRAM single GPU. Setting OLLAMA_NUM_PARALLEL=4 + MAX_LOADED_MODELS=2 for faster concurrent inference."
     fi
 else
     echo "[!] No NVIDIA drivers found. Mode: CPU Only."
@@ -156,17 +161,25 @@ else
     echo "[+] CPU Mode. Selecting lightweight model: $SELECTED_MODEL"
 fi
 
-# Specialist tasks (entity match / validation / classification) are much
-# faster on 8B while still accurate for structured extraction. Keep the final
-# narrative summarizer on the main selected model.
-case "$SELECTED_MODEL" in
-    qwen3:32b|mistral-small:24b|qwen2.5:32b)
-        SPECIALIST_MODEL_DEFAULT="llama3.1:8b"
-        ;;
-    *)
-        SPECIALIST_MODEL_DEFAULT="$SELECTED_MODEL"
-        ;;
-esac
+# Requested production mapping (quality-first):
+#   AI_MODEL_NAME=qwen3:32b
+#   AI_MODEL_MATCHER=qwen3:32b
+#   AI_MODEL_MATCHER_STRONG=qwen2.5:72b
+#   AI_MODEL_VALIDATOR=qwen3:32b
+#   AI_MODEL_VALIDATOR_STRONG=qwen2.5:72b
+#   AI_MODEL_SUMMARIZER=mistral-small:24b
+#   AI_MODEL_SUMMARIZER_STRONG=qwen3:32b
+export AI_MODEL_NAME=${AI_MODEL_NAME:-qwen3:32b}
+export AI_MODEL_MATCHER=${AI_MODEL_MATCHER:-qwen3:32b}
+export AI_MODEL_MATCHER_STRONG=${AI_MODEL_MATCHER_STRONG:-qwen2.5:72b}
+export AI_MODEL_VALIDATOR=${AI_MODEL_VALIDATOR:-qwen3:32b}
+export AI_MODEL_VALIDATOR_STRONG=${AI_MODEL_VALIDATOR_STRONG:-qwen2.5:72b}
+export AI_MODEL_SUMMARIZER=${AI_MODEL_SUMMARIZER:-mistral-small:24b}
+export AI_MODEL_SUMMARIZER_STRONG=${AI_MODEL_SUMMARIZER_STRONG:-qwen3:32b}
+
+# Keep compatibility with existing installer variables used below.
+SELECTED_MODEL="$AI_MODEL_NAME"
+SPECIALIST_MODEL_DEFAULT="$AI_MODEL_MATCHER"
 
 echo "[*] Pulling AI Model: $SELECTED_MODEL (This may take time...)"
 ollama pull $SELECTED_MODEL
@@ -174,6 +187,14 @@ if [ "$SPECIALIST_MODEL_DEFAULT" != "$SELECTED_MODEL" ]; then
     echo "[*] Pulling Specialist Model: $SPECIALIST_MODEL_DEFAULT"
     ollama pull $SPECIALIST_MODEL_DEFAULT
 fi
+
+# Ensure all configured specialist strong models are present.
+for EXTRA_MODEL in "$AI_MODEL_MATCHER_STRONG" "$AI_MODEL_VALIDATOR_STRONG" "$AI_MODEL_SUMMARIZER" "$AI_MODEL_SUMMARIZER_STRONG"; do
+    if [ -n "$EXTRA_MODEL" ]; then
+        echo "[*] Pulling Configured Model: $EXTRA_MODEL"
+        ollama pull "$EXTRA_MODEL" || echo "[!] Failed to pull $EXTRA_MODEL (continuing)"
+    fi
+done
 
 # Optional alternative reasoners the API can switch to per-request via
 # {"model": "<name>"}. Only pre-pulled on hosts with enough VRAM/disk.
@@ -192,9 +213,12 @@ if [ "$HAS_NVIDIA" = true ] && [ "$TOTAL_VRAM_MB" -gt 45000 ] && [ "$AVAIL_DISK_
     done
 fi
 
-# Set environment variable for the app to know which model is in use
-export AI_MODEL_NAME=$SELECTED_MODEL
-export AI_MODEL_ALLOWED=$ALT_MODELS
+# Set environment variable allow-list for per-request model override.
+BASE_ALLOWED="qwen3:32b,qwen2.5:72b,mistral-small:24b"
+if [ -n "$ALT_MODELS" ]; then
+    BASE_ALLOWED="$BASE_ALLOWED,$ALT_MODELS"
+fi
+export AI_MODEL_ALLOWED=${AI_MODEL_ALLOWED:-$BASE_ALLOWED}
 
 # 4. Create Directory Structure
 echo "[*] Setting up directories..."
@@ -244,7 +268,7 @@ import smtplib
 import contextvars
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Literal
 from urllib.parse import urlparse, parse_qs, unquote, urljoin, quote_plus
 from pydantic import BaseModel, EmailStr, Field, model_validator
 from fastapi import FastAPI, HTTPException
@@ -269,11 +293,30 @@ AI_MODEL = os.getenv("AI_MODEL_NAME", "qwen3:32b")
 # a smaller/faster model (e.g. AI_MODEL_MATCHER=llama3.1:8b for entity match,
 # AI_MODEL_SUMMARIZER=mistral-small:24b for narrative output).
 AI_MODEL_MATCHER = os.getenv("AI_MODEL_MATCHER", AI_MODEL)        # entity / name matching
+AI_MODEL_MATCHER_STRONG = os.getenv("AI_MODEL_MATCHER_STRONG", AI_MODEL_MATCHER)  # quality-first extraction
 AI_MODEL_VALIDATOR = os.getenv("AI_MODEL_VALIDATOR", AI_MODEL)    # website-to-company validation
+AI_MODEL_VALIDATOR_STRONG = os.getenv("AI_MODEL_VALIDATOR_STRONG", AI_MODEL_VALIDATOR)  # quality-first website rerank
 AI_MODEL_ADDRESS = os.getenv("AI_MODEL_ADDRESS", AI_MODEL)        # address comparison / verification
 AI_MODEL_CLASSIFIER = os.getenv("AI_MODEL_CLASSIFIER", AI_MODEL)  # industry / sector classification
 AI_MODEL_SUMMARIZER = os.getenv("AI_MODEL_SUMMARIZER", AI_MODEL)  # final business activity summary
+AI_MODEL_SUMMARIZER_STRONG = os.getenv("AI_MODEL_SUMMARIZER_STRONG", AI_MODEL_SUMMARIZER)  # quality-first narrative
 COMPANIES_HOUSE_API_KEY = os.getenv("COMPANIES_HOUSE_API_KEY", "").strip()
+
+def _env_int(name: str, default: int, min_value: int, max_value: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        val = int(str(raw).strip())
+    except Exception:
+        return default
+    return max(min_value, min(max_value, val))
+
+WEBSITE_AI_RERANK_ENABLED = os.getenv("WEBSITE_AI_RERANK_ENABLED", "1").strip().lower() not in {
+    "0", "false", "no", "off",
+}
+WEBSITE_AI_RERANK_TOP_K = _env_int("WEBSITE_AI_RERANK_TOP_K", 4, 2, 8)
+WEBSITE_AI_RERANK_MAX_EXCERPT = _env_int("WEBSITE_AI_RERANK_MAX_EXCERPT", 1600, 600, 4000)
 
 # Models the API is allowed to switch to via the per-request `model` field.
 # Always includes AI_MODEL; installer adds extras like qwen2.5:32b on capable hosts.
@@ -291,9 +334,15 @@ _REQUEST_THINK: "contextvars.ContextVar[bool | None]" = contextvars.ContextVar(
     "request_think", default=None
 )
 
+# Per-request quality preset used by quality-sensitive ranking paths.
+_REQUEST_QUALITY: "contextvars.ContextVar[str]" = contextvars.ContextVar(
+    "request_quality", default="balanced"
+)
+
 # Models known to support an Ollama `think` toggle. Defaults to OFF for latency
 # unless the caller passes `"think": true`.
 THINKING_MODEL_PREFIXES = ("qwen3", "deepseek-r1", "r1", "o1")
+QUALITY_MODES = ("fast", "balanced", "high")
 
 def model_supports_thinking(model: str) -> bool:
     m = (model or "").lower()
@@ -303,15 +352,78 @@ def get_main_model() -> str:
     """Return the active main reasoner model for the current request."""
     return _REQUEST_MODEL.get() or AI_MODEL
 
-def get_summarizer_model() -> str:
-    """Return the active summarizer model. Per-request override wins."""
-    return _REQUEST_MODEL.get() or AI_MODEL_SUMMARIZER
+def get_matcher_model(quality_mode: Optional[str] = None) -> str:
+    """Entity/name extraction model. Per-request override wins.
+
+    In high quality mode, prefer the stronger extraction model if configured.
+    """
+    override = _REQUEST_MODEL.get()
+    if override:
+        return override
+    mode = (quality_mode or _REQUEST_QUALITY.get() or "balanced").strip().lower()
+    if mode == "high":
+        return AI_MODEL_MATCHER_STRONG or AI_MODEL_MATCHER
+    return AI_MODEL_MATCHER
+
+def get_validator_model(quality_mode: Optional[str] = None, prefer_strong: bool = False) -> str:
+    """Website validation/reranking model. Per-request override wins.
+
+    When quality_mode is high (or prefer_strong=True), prefer the stronger
+    validator model if configured.
+    """
+    override = _REQUEST_MODEL.get()
+    if override:
+        return override
+    mode = (quality_mode or _REQUEST_QUALITY.get() or "balanced").strip().lower()
+    if prefer_strong or mode == "high":
+        return AI_MODEL_VALIDATOR_STRONG or AI_MODEL_VALIDATOR
+    return AI_MODEL_VALIDATOR
+
+def get_address_model() -> str:
+    """Address-verification model. Per-request override wins."""
+    return _REQUEST_MODEL.get() or AI_MODEL_ADDRESS
+
+def get_quality_mode() -> str:
+    q = (_REQUEST_QUALITY.get() or "balanced").strip().lower()
+    return q if q in QUALITY_MODES else "balanced"
+
+def get_summarizer_model(quality_mode: Optional[str] = None) -> str:
+    """Return the active summarizer model. Per-request override wins.
+
+    In high quality mode, prefer the stronger summarizer model if configured.
+    """
+    override = _REQUEST_MODEL.get()
+    if override:
+        return override
+    mode = (quality_mode or _REQUEST_QUALITY.get() or "balanced").strip().lower()
+    if mode == "high":
+        return AI_MODEL_SUMMARIZER_STRONG or AI_MODEL_SUMMARIZER
+    return AI_MODEL_SUMMARIZER
 
 def chat_kwargs(model: str) -> Dict[str, Any]:
     """Build kwargs for ollama.chat, including a `think` flag when the model
     supports it. Per-request override (`_REQUEST_THINK`) wins; default is OFF
-    for thinking-capable models to keep latency predictable."""
-    kwargs: Dict[str, Any] = {}
+    for thinking-capable models to keep latency predictable.
+
+    Also forces deterministic generation (temperature=0, fixed seed) so the
+    same input yields the same output across runs. Without this, Ollama's
+    default temperature (0.8) makes website validation, address verification
+    and summaries nondeterministic — picks flip between runs.
+    """
+    kwargs: Dict[str, Any] = {
+        # keep_alive=-1 ensures the model stays resident on GPU across calls,
+        # avoiding cold-load penalties (3-8s per swap on big models).
+        "keep_alive": -1,
+        "options": {
+            "temperature": 0,
+            "top_p": 1,
+            "seed": 0,
+            # Cap response length: extraction/validation/summary prompts all
+            # fit comfortably in 600 tokens. Without a cap the model can ramble
+            # for thousands of tokens, dominating wall time.
+            "num_predict": 768,
+        },
+    }
     if model_supports_thinking(model):
         override = _REQUEST_THINK.get()
         kwargs["think"] = bool(override) if override is not None else False
@@ -346,8 +458,23 @@ Features:
 - **Overall summary** — cross-referenced B2B profile with Companies House priority, verified phones, domains_scanned
 - **Parallel processing** — concurrent AI inference, Companies House lookups, and page crawling
 """,
-    version="2.8.2"
+    version="2.7.0"
 )
+
+@app.on_event("startup")
+async def _widen_default_executor() -> None:
+    """Replace asyncio's default ThreadPoolExecutor (default 32 workers, but
+    many of those slots are consumed by FastAPI/uvicorn). A larger executor
+    lets concurrent ``loop.run_in_executor(None, ...)`` calls — used for page
+    fetches and ``ollama.chat`` invocations — run in parallel instead of
+    queuing serially behind the default pool.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(ThreadPoolExecutor(max_workers=64, thread_name_prefix="enrich"))
+        logger.info("Default asyncio executor widened to 64 workers.")
+    except Exception as e:
+        logger.warning(f"Could not widen default executor: {e}")
 
 # --- Pydantic Models ---
 
@@ -369,6 +496,10 @@ class EnrichRequest(BaseModel):
     think: Optional[bool] = Field(
         default=None,
         description="Toggle thinking/reasoning mode for thinking-capable models (qwen3, deepseek-r1). Default off for latency.",
+    )
+    quality_mode: Literal["fast", "balanced", "high"] = Field(
+        default="balanced",
+        description="Quality preset for discovery/validation. 'high' enables stronger AI reranking when available.",
     )
 
     @model_validator(mode="after")
@@ -419,6 +550,10 @@ class CrawlBusinessesRequest(BaseModel):
     think: Optional[bool] = Field(
         default=None,
         description="Toggle thinking/reasoning mode for thinking-capable models (qwen3, deepseek-r1). Default off for latency.",
+    )
+    quality_mode: Literal["fast", "balanced", "high"] = Field(
+        default="balanced",
+        description="Quality preset for discovery/validation. 'high' enables stronger AI reranking when available.",
     )
 
 class SystemStatus(BaseModel):
@@ -1137,7 +1272,9 @@ def normalize_directors(ai_data: Dict[str, Any], text_content: str) -> Dict[str,
     return ai_data
 
 
-async def run_ai_extraction(text_content: str, hints: Optional[Dict[str, str]] = None):
+async def run_ai_extraction(text_content: str,
+                            hints: Optional[Dict[str, str]] = None,
+                            quality_mode: Optional[str] = None):
     """
     Asynchronous wrapper for Ollama calls.
     Prevents blocking the event loop during heavy AI inference.
@@ -1148,7 +1285,7 @@ async def run_ai_extraction(text_content: str, hints: Optional[Dict[str, str]] =
     loop = asyncio.get_event_loop()
     try:
         # Run synchronous ollama call in a thread executor
-        _model = get_main_model()
+        _model = get_matcher_model(quality_mode)
         _kw = chat_kwargs(_model)
         response = await loop.run_in_executor(
             None,
@@ -1243,10 +1380,24 @@ def parse_ddg_result_url(href: str) -> str:
     return ""
 
 
-def discover_business_urls(query: str, location: Optional[str], max_results: int) -> List[Dict[str, str]]:
+def discover_business_urls(query: str,
+                           location: Optional[str],
+                           max_results: int,
+                           quality_mode: str = "balanced") -> List[Dict[str, str]]:
     search_query = query.strip()
     if location:
         search_query = f"{search_query} {location.strip()}"
+
+    mode = (quality_mode or "balanced").strip().lower()
+    if mode not in QUALITY_MODES:
+        mode = "balanced"
+
+    # Quality budget: high explores deeper candidate pools and more SERP
+    # variants; fast keeps a narrower budget for lower latency.
+    per_query_multiplier = 2 if mode == "fast" else 3 if mode == "balanced" else 5
+    target_count = max_results
+    if mode == "high":
+        target_count = min(50, max(max_results + 4, int(max_results * 1.8)))
 
     blocked_domains = {
         "bing.com", "www.bing.com", "duckduckgo.com", "www.duckduckgo.com",
@@ -1266,10 +1417,27 @@ def discover_business_urls(query: str, location: Optional[str], max_results: int
     #    search engines miss it.
     cleaned = strip_phones_from_text(search_query)
     query_variants: List[str] = []
+    seen_query_variants: set = set()
+
+    def _add_variant(v: str) -> None:
+        v = (v or "").strip()
+        if not v:
+            return
+        key = v.lower()
+        if key in seen_query_variants:
+            return
+        seen_query_variants.add(key)
+        query_variants.append(v)
+
     if cleaned and cleaned.lower() != search_query.lower():
-        query_variants.append(cleaned)
+        _add_variant(cleaned)
     else:
-        query_variants.append(search_query)
+        _add_variant(search_query)
+
+    # High-quality mode also probes the raw query even when a cleaned query
+    # exists, so phone-bearing prompts can surface phone-confirmed sites.
+    if mode == "high" and cleaned and cleaned.lower() != search_query.lower():
+        _add_variant(search_query)
     # Build a quoted-name probe from the cleaned company name (or original if
     # cleaning produced nothing).
     name_for_quote = (cleaned or search_query).strip()
@@ -1278,12 +1446,23 @@ def discover_business_urls(query: str, location: Optional[str], max_results: int
     if location and name_for_quote.lower().endswith(location.strip().lower()):
         name_for_quote = name_for_quote[: -len(location.strip())].strip()
     if name_for_quote and len(name_for_quote.split()) >= 2:
-        quoted = f'"{name_for_quote}" UK company'
-        if quoted.lower() not in {v.lower() for v in query_variants}:
-            query_variants.append(quoted)
+        _add_variant(f'"{name_for_quote}" UK company')
+
+        if mode == "high":
+            official = f'"{name_for_quote}" official website'
+            contact = f'"{name_for_quote}" contact'
+            if location:
+                official = f"{official} {location.strip()}"
+                contact = f"{contact} {location.strip()}"
+            _add_variant(official)
+            _add_variant(contact)
+
+    # Fast mode uses only the strongest first variant to minimize latency.
+    if mode == "fast" and len(query_variants) > 1:
+        query_variants = query_variants[:1]
 
     for q in query_variants:
-        for item in search_public_results(q, max_results * 3):
+        for item in search_public_results(q, max_results * per_query_multiplier):
             domain = (item.get("domain") or "").lower()
             url = item.get("url") or ""
             if not domain or not url:
@@ -1300,9 +1479,9 @@ def discover_business_urls(query: str, location: Optional[str], max_results: int
                 continue
             seen_domains.add(domain)
             candidates.append(item)
-            if len(candidates) >= max_results:
+            if len(candidates) >= target_count:
                 return candidates
-    return candidates
+    return candidates[:target_count]
 
 
 _DDG_DISABLED_UNTIL = 0.0  # process-level circuit breaker; epoch seconds
@@ -1381,6 +1560,16 @@ def _search_with_crawl4ai(query: str, max_results: int) -> List[Dict[str, str]]:
         ("ddg",  f"https://duckduckgo.com/html/?q={quote_plus(query)}&kl=uk-en"),
         ("bing", f"https://www.bing.com/search?q={quote_plus(query)}&count={max(10, max_results)}&cc=GB&setlang=en-GB&mkt=en-GB"),
     ]
+    # Run BOTH engines and merge results, deduped by domain. The previous
+    # short-circuit (first engine wins) made the candidate pool unstable
+    # across runs because DDG and Bing return very different result sets
+    # from datacenter IPs — the same query could surface luxurycottages.com
+    # one minute and only generic travel sites the next. Aggregating both
+    # gives a deeper, more stable pool for the validator to choose from.
+    aggregated: List[Dict[str, str]] = []
+    seen_domains: set = set()
+    seen_urls: set = set()
+    any_engine_returned = False
     for engine, url in targets:
         html = fetch_html_with_crawl4ai(url, timeout_s=20)
         if not html:
@@ -1457,11 +1646,27 @@ def _search_with_crawl4ai(query: str, max_results: int) -> List[Dict[str, str]]:
                     )
                 results = filtered
         if results:
-            logger.info(f"Crawl4AI SERP via {engine} returned {len(results)} for '{query[:60]}'")
-            return results
-    # Both engines yielded nothing — short breaker so we don't keep paying ~30s per call.
-    _BROWSER_SEARCH_DISABLED_UNTIL = time.time() + 120
-    logger.warning(f"Crawl4AI SERP empty for '{query[:60]}' (disabled 2m)")
+            any_engine_returned = True
+            added = 0
+            for r in results:
+                dom = r.get("domain") or ""
+                u = (r.get("url") or "").lower().strip()
+                if not dom or dom in seen_domains or u in seen_urls:
+                    continue
+                seen_domains.add(dom)
+                seen_urls.add(u)
+                aggregated.append(r)
+                added += 1
+            logger.info(
+                f"Crawl4AI SERP via {engine} returned {len(results)} for '{query[:60]}' "
+                f"(+{added} new → pool {len(aggregated)})"
+            )
+    if aggregated:
+        return aggregated[:max(max_results * 2, max_results)]
+    if not any_engine_returned:
+        # Both engines yielded nothing — short breaker so we don't keep paying ~30s per call.
+        _BROWSER_SEARCH_DISABLED_UNTIL = time.time() + 120
+        logger.warning(f"Crawl4AI SERP empty for '{query[:60]}' (disabled 2m)")
     return []
 
 
@@ -2098,7 +2303,7 @@ async def run_ai_address_verification(company_name: str, location: Optional[str]
     prompt = build_address_verification_prompt(company_name, location, country, evidence)
     loop = asyncio.get_event_loop()
     try:
-        _model = get_main_model()
+        _model = get_address_model()
         _kw = chat_kwargs(_model)
         response = await loop.run_in_executor(
             None,
@@ -2474,11 +2679,6 @@ _HQ_LABEL_RE = re.compile(
     flags=re.IGNORECASE,
 )
 
-_ADDRESS_LABEL_RE = re.compile(
-    r"\b(address|head\s*office|headquarters|main\s+office|registered\s+office|principal\s+office|our\s+office|visit\s+us|find\s+us|location|hq)\b\s*[:\-]?\s*$",
-    flags=re.IGNORECASE | re.MULTILINE,
-)
-
 _POSTCODE_TOKEN_RE = re.compile(
     r"\b(?:[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}|\d{5}(?:-\d{4})?)\b",
     flags=re.IGNORECASE,
@@ -2517,8 +2717,6 @@ def _label_driven_address_candidates(text: str) -> List[Dict[str, Any]]:
             continue
         label_text = (m.group(1) if m else inline_m.group(1)).lower()
         is_main = bool(re.search(r"head|hq|headquarters|main|registered|principal", label_text))
-        # Build candidate from following lines (or from inline tail) until we
-        # capture a postcode or run out of plausible lines.
         if inline_m:
             collected = [inline_m.group(2).strip()]
             scan = lines[idx + 1: idx + 7]
@@ -2619,13 +2817,9 @@ def extract_website_address(domain: str, country_hint: Optional[str]) -> Dict[st
             key = postcode or line1_slug or slugify_text(cand)
             if not key:
                 continue
-            # Look for an HQ / head-office / main-office label near this
-            # candidate within the same page so we can promote it later.
             probe = cand[:60].lower()
             idx = text_lower.find(probe) if probe else -1
             if idx < 0:
-                # Fallback: locate by postcode token (often more stable than
-                # the long candidate snippet).
                 if postcode:
                     idx = text_lower.find(postcode.lower())
             if idx >= 0:
@@ -2966,6 +3160,14 @@ def _phone_digit_variants(query_phones: List[Dict[str, Any]]) -> List[str]:
     return out
 
 
+def _text_excerpt(text: Optional[str], max_chars: int = WEBSITE_AI_RERANK_MAX_EXCERPT) -> str:
+    """Compact page text into a bounded single-line excerpt for LLM reranking."""
+    compact = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(compact) <= max_chars:
+        return compact
+    return compact[:max_chars] + "..."
+
+
 def pick_likely_website(results: List[Dict[str, Any]],
                         ch_record: Optional[Dict[str, Any]],
                         country_hint: Optional[str],
@@ -3012,6 +3214,8 @@ def pick_likely_website(results: List[Dict[str, Any]],
             "mismatches": match["mismatches"],
             "signals": match["signals"],
             "ai_confidence": ai_conf,
+            "evidence_excerpt": _text_excerpt(text),
+            "source_pass": "pass1_discovery",
         })
 
     if not candidates:
@@ -3045,20 +3249,13 @@ def find_official_website(ch_record: Dict[str, Any],
     # Strip the corporate suffix to broaden the search a little.
     short_name = re.sub(r"\b(limited|ltd|plc|llp|llc|inc)\.?\b", "", legal_name, flags=re.IGNORECASE).strip()
 
-    queries = [
-        f'"{legal_name}" official site',
-        f'"{legal_name}" contact',
-        f'"{legal_name}"',
-    ]
-    if short_name and short_name.lower() != legal_name.lower():
-        queries.append(f'"{short_name}" official site')
-    if country_hint:
-        queries.insert(0, f'"{legal_name}" {country_hint}')
-
-    # Director-anchored probe: many brand-website-vs-legal-name mismatches
-    # (e.g. "LUXURY HOLIDAYS AND HONEYMOONS LTD" trading as luxurycottages.com)
-    # only resolve when we search by the active director's name. Use the most
-    # recently appointed director if available.
+    # Build queries with director-anchored probes FIRST. Many brand-website-
+    # vs-legal-name mismatches (e.g. "LUXURY HOLIDAYS AND HONEYMOONS LTD"
+    # trading as luxurycottages.com) only resolve when we search by the
+    # active director's name. If we ran legal-name queries first, generic
+    # SERP hits would fill the candidate slots and the director hits would
+    # be discarded by the early-cap break below.
+    director_queries: List[str] = []
     directors_list = ch_record.get("directors") or []
     if directors_list:
         for d in directors_list[:2]:
@@ -3080,9 +3277,23 @@ def find_official_website(ch_record: Dict[str, Any],
                     continue
                 director_full = f"{parts[0].title()} {parts[-1].title()}"
             anchor = short_name or legal_name
-            queries.append(f'"{director_full}" "{anchor}"')
+            director_queries.append(f'"{director_full}" "{anchor}"')
             if country_hint:
-                queries.append(f'"{director_full}" {country_hint}')
+                director_queries.append(f'"{director_full}" {country_hint}')
+
+    name_queries: List[str] = [
+        f'"{legal_name}" official site',
+        f'"{legal_name}" contact',
+        f'"{legal_name}"',
+    ]
+    if short_name and short_name.lower() != legal_name.lower():
+        name_queries.append(f'"{short_name}" official site')
+    if country_hint:
+        name_queries.insert(0, f'"{legal_name}" {country_hint}')
+
+    # Director queries first — they're the highest-precision signal for the
+    # brand/legal-name mismatch case. Legal-name queries follow.
+    queries = director_queries + name_queries
 
     seen: Dict[str, Dict[str, str]] = {}
     # Domains that never represent the company itself; reject early so they
@@ -3106,7 +3317,7 @@ def find_official_website(ch_record: Dict[str, Any],
             logger.warning(f"Official-site search failed for '{q}': {e}")
             return q, []
 
-    with ThreadPoolExecutor(max_workers=min(4, max(1, len(queries)))) as executor:
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(queries)))) as executor:
         for _q, hits in executor.map(_run_query, queries):
             for hit in hits:
                 domain = hit.get("domain") or ""
@@ -3123,9 +3334,31 @@ def find_official_website(ch_record: Dict[str, Any],
                 break
 
     candidates: List[Dict[str, Any]] = []
+    digit_variants = _phone_digit_variants(query_phones) if query_phones else []
     for domain, hit in seen.items():
         url = hit.get("url") or f"https://{domain}"
         text = clean_text_from_url(url) or ""
+        # If a query phone was supplied but doesn't appear on the SERP
+        # landing page, also peek at /contact, /about, etc. — companies
+        # frequently list their phone there and not on a deep landing page.
+        # This mirrors find_website_by_phone so the +35 query_phone_on_page
+        # signal can actually fire in the legal-name discovery pass too.
+        if digit_variants:
+            page_digits = re.sub(r"\D", "", text)
+            if not any(v and v in page_digits for v in digit_variants):
+                for path in ("/contact", "/contact-us", "/about", "/about-us"):
+                    try:
+                        extra_url = f"https://{domain}{path}"
+                        extra_html = fetch_html_from_url(extra_url) or ""
+                        if not extra_html:
+                            continue
+                        extra_text = html_to_text(extra_html)
+                        if extra_text:
+                            text = (text + "\n" + extra_text)[:80000]
+                            if any(v and v in re.sub(r"\D", "", extra_text) for v in digit_variants):
+                                break
+                    except Exception:
+                        continue
         match = website_company_match_score(
             ch_record, text, domain, None, None, country_hint,
             query_phones=query_phones,
@@ -3141,6 +3374,8 @@ def find_official_website(ch_record: Dict[str, Any],
             "mismatches": match["mismatches"],
             "signals": match["signals"],
             "ai_confidence": 0,
+            "evidence_excerpt": _text_excerpt(text),
+            "source_pass": "pass2_legal_name",
         })
 
     if not candidates:
@@ -3220,7 +3455,7 @@ def find_website_by_phone(query_phones: List[Dict[str, Any]],
             logger.warning(f"Phone-based search failed for '{q}': {e}")
             return q, []
 
-    with ThreadPoolExecutor(max_workers=min(4, max(1, len(queries_to_run)))) as executor:
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(queries_to_run)))) as executor:
         for _q, hits in executor.map(_run_phone_query, queries_to_run):
             for hit in hits:
                 domain = (hit.get("domain") or "").lower()
@@ -3287,6 +3522,8 @@ def find_website_by_phone(query_phones: List[Dict[str, Any]],
             "mismatches": match["mismatches"],
             "signals": match["signals"],
             "ai_confidence": 0,
+            "evidence_excerpt": _text_excerpt(text),
+            "source_pass": "pass3_phone",
         })
 
     if not candidates:
@@ -3304,6 +3541,181 @@ def find_website_by_phone(query_phones: List[Dict[str, Any]],
     if int(best.get("match_score") or 0) < WEBSITE_MIN_MATCH_SCORE:
         return {"selected": None, "candidates": candidates}
     return {"selected": best, "candidates": candidates}
+
+
+def build_website_ai_rerank_prompt(query: str,
+                                   country_hint: Optional[str],
+                                   ch_record: Optional[Dict[str, Any]],
+                                   query_phones: Optional[List[Dict[str, Any]]],
+                                   candidates: List[Dict[str, Any]]) -> str:
+    ch = ch_record or {}
+    directors = []
+    for d in (ch.get("directors") or [])[:5]:
+        if isinstance(d, dict) and d.get("name"):
+            directors.append(str(d.get("name")))
+
+    phone_hints: List[str] = []
+    for ph in (query_phones or []):
+        for key in ("international", "national", "e164"):
+            value = str(ph.get(key) or "").strip()
+            if value and value not in phone_hints:
+                phone_hints.append(value)
+
+    payload = {
+        "query": query,
+        "country_hint": country_hint,
+        "companies_house": {
+            "matched_company_name": ch.get("matched_company_name"),
+            "company_number": ch.get("company_number"),
+            "company_status": ch.get("company_status"),
+            "registered_office_address": format_registered_office_address(ch.get("registered_office_address")),
+            "directors": directors,
+        },
+        "query_phones": phone_hints,
+        "candidates": [
+            {
+                "domain": c.get("domain"),
+                "url": c.get("url"),
+                "title": c.get("title"),
+                "source_pass": c.get("source_pass"),
+                "rule_match_score": int(c.get("match_score") or 0),
+                "rule_matches": (c.get("matches") or [])[:8],
+                "rule_mismatches": (c.get("mismatches") or [])[:6],
+                "evidence_excerpt": c.get("evidence_excerpt") or "",
+            }
+            for c in candidates
+        ],
+    }
+
+    return f"""
+You are validating which domain is the official website for a real business.
+
+Use ONLY the provided evidence. Do not invent facts.
+
+Priority rules:
+1) A candidate containing the user query phone on page is a very strong signal.
+2) Prefer domains whose evidence aligns with Companies House legal name, company number, directors, and address.
+3) Reject obvious directories, social networks, scam/phone-lookup pages, and unrelated blogs/news.
+4) Prefer official business sites over marketplaces/aggregators when evidence conflicts.
+
+Input data (JSON):
+{json.dumps(payload, ensure_ascii=True)}
+
+Return ONLY valid JSON with this shape:
+{{
+  "selected_domain": "example.com" or null,
+  "confidence": 0-100,
+  "reason": "short explanation",
+  "domain_scores": [
+    {{"domain": "example.com", "score": 0-100, "reason": "short"}}
+  ]
+}}
+"""
+
+
+async def run_ai_website_rerank(query: str,
+                                country_hint: Optional[str],
+                                ch_record: Optional[Dict[str, Any]],
+                                query_phones: Optional[List[Dict[str, Any]]],
+                                candidates: List[Dict[str, Any]],
+                                quality_mode: str = "balanced") -> Optional[Dict[str, Any]]:
+    if not WEBSITE_AI_RERANK_ENABLED:
+        return None
+    if not candidates or len(candidates) < 2:
+        return None
+
+    mode = (quality_mode or "balanced").strip().lower()
+    if mode not in QUALITY_MODES:
+        mode = "balanced"
+
+    # Keep fast mode bounded. Balanced/high evaluate a deeper shortlist.
+    if mode == "fast":
+        top_k = min(3, len(candidates))
+    elif mode == "high":
+        top_k = min(max(WEBSITE_AI_RERANK_TOP_K, 5), len(candidates))
+    else:
+        top_k = min(WEBSITE_AI_RERANK_TOP_K, len(candidates))
+
+    shortlist = candidates[:top_k]
+    if len(shortlist) < 2:
+        return None
+
+    top_score = int(shortlist[0].get("match_score") or 0)
+    second_score = int(shortlist[1].get("match_score") or 0)
+    score_gap = top_score - second_score
+    phone_confirmed_on_top = "query_phone_on_page" in (shortlist[0].get("matches") or [])
+    ambiguous = (score_gap <= 12) or (not phone_confirmed_on_top)
+
+    prefer_strong = mode == "high" or (mode == "balanced" and ambiguous)
+    model = get_validator_model(mode, prefer_strong=prefer_strong)
+    prompt = build_website_ai_rerank_prompt(
+        query=query,
+        country_hint=country_hint,
+        ch_record=ch_record,
+        query_phones=query_phones,
+        candidates=shortlist,
+    )
+
+    loop = asyncio.get_event_loop()
+    try:
+        _kw = chat_kwargs(model)
+        response = await loop.run_in_executor(
+            None,
+            lambda: ollama.chat(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                format="json",
+                **_kw,
+            ),
+        )
+        parsed = json.loads(response["message"]["content"])
+        if not isinstance(parsed, dict):
+            return None
+
+        shortlist_domains = {str(c.get("domain") or "").lower() for c in shortlist}
+        selected_raw = str(parsed.get("selected_domain") or "").strip().lower()
+        if selected_raw.startswith("http"):
+            selected_raw = normalize_domain(selected_raw)
+        if selected_raw.startswith("www."):
+            selected_raw = selected_raw[4:]
+        selected_domain = selected_raw if selected_raw in shortlist_domains else None
+
+        confidence = int(parsed.get("confidence") or 0)
+        confidence = max(0, min(100, confidence))
+        reason = str(parsed.get("reason") or "").strip()[:280]
+
+        score_map: Dict[str, int] = {}
+        for item in (parsed.get("domain_scores") or []):
+            if not isinstance(item, dict):
+                continue
+            dom = str(item.get("domain") or "").strip().lower()
+            if dom.startswith("http"):
+                dom = normalize_domain(dom)
+            if dom.startswith("www."):
+                dom = dom[4:]
+            if not dom or dom not in shortlist_domains:
+                continue
+            try:
+                score = int(item.get("score") or 0)
+            except Exception:
+                continue
+            score_map[dom] = max(0, min(100, score))
+
+        if not score_map and not selected_domain:
+            return None
+
+        return {
+            "model": model,
+            "quality_mode": mode,
+            "selected_domain": selected_domain,
+            "confidence": confidence,
+            "reason": reason,
+            "domain_scores": score_map,
+            "candidate_count": len(shortlist),
+        }
+    except Exception as e:
+        logger.warning(f"AI website rerank failed: {e}")
+        return None
 
 
 
@@ -3336,11 +3748,11 @@ def build_ai_business_summary_prompt(record: Dict[str, Any]) -> str:
     """
 
 
-async def run_ai_business_summary(record: Dict[str, Any]) -> Optional[str]:
+async def run_ai_business_summary(record: Dict[str, Any], quality_mode: Optional[str] = None) -> Optional[str]:
     prompt = build_ai_business_summary_prompt(record)
     loop = asyncio.get_event_loop()
     try:
-        _model = get_summarizer_model()
+        _model = get_summarizer_model(quality_mode)
         _kw = chat_kwargs(_model)
         response = await loop.run_in_executor(
             None,
@@ -3547,7 +3959,7 @@ def discover_company_emails(site_domain: str,
             pass
         return {"url": url, "emails": raw_emails}
 
-    with ThreadPoolExecutor(max_workers=min(8, max(1, len(urls)))) as executor:
+    with ThreadPoolExecutor(max_workers=min(16, max(1, len(urls)))) as executor:
         futures = [executor.submit(process_url, u) for u in urls]
         for fut in as_completed(futures):
             try:
@@ -3600,7 +4012,8 @@ def discover_company_emails(site_domain: str,
 async def build_verified_b2b_record(query: str,
                                     location: Optional[str],
                                     results: List[Dict[str, Any]],
-                                    overall_summary: Dict[str, Any]) -> Dict[str, Any]:
+                                    overall_summary: Dict[str, Any],
+                                    quality_mode: str = "balanced") -> Dict[str, Any]:
     """Produce the final structured CRM-ready record.
 
     Layers:
@@ -3616,6 +4029,9 @@ async def build_verified_b2b_record(query: str,
     mismatch_warnings, and a final 'final_enrichment_summary' string.
     """
     successful = [r for r in results if r.get("status") == "success"]
+    quality_mode = (quality_mode or "balanced").strip().lower()
+    if quality_mode not in QUALITY_MODES:
+        quality_mode = "balanced"
     record: Dict[str, Any] = {
         "query": query,
         "location": location,
@@ -3747,55 +4163,137 @@ async def build_verified_b2b_record(query: str,
             "Companies House registered office is a shared/default address — "
             "postcode/line-1 matches will not score websites")
 
-    # Pass 1: score the URLs that the original discovery already crawled.
-    website_choice = await asyncio.get_event_loop().run_in_executor(
+    # Passes 1, 2, 3 are independent: run them concurrently rather than
+    # sequentially. Each pass does its own SERP queries + page fetches +
+    # LLM rerank, so serializing them was wall-time = sum(p1, p2, p3).
+    # Concurrent execution drops it to wall-time = max(p1, p2, p3) and the
+    # union/dedup logic below already handles their combined output.
+    loop = asyncio.get_event_loop()
+    pass1_fut = loop.run_in_executor(
         None, lambda: pick_likely_website(
             results, ch_primary, location,
             query_phones=query_phones,
             registered_office_is_proxy=registered_office_is_proxy,
         ),
     )
-    selected_site = website_choice.get("selected")
+    pass2_fut = loop.run_in_executor(
+        None, lambda: find_official_website(
+            ch_primary, location, 8,
+            query_phones=query_phones,
+            registered_office_is_proxy=registered_office_is_proxy,
+        ),
+    ) if ch_primary else None
+    pass3_fut = loop.run_in_executor(
+        None, lambda: find_website_by_phone(
+            query_phones, ch_primary, location, 10,
+            registered_office_is_proxy=registered_office_is_proxy,
+        ),
+    ) if query_phones else None
 
-    # Pass 2: if Companies House gave us a clean legal name, run a focused
-    # search using just that name. Original queries can include phone numbers,
-    # SIC keywords, etc., which often surface phone-lookup or scam-list pages.
-    fresh_choice: Dict[str, Any] = {"selected": None, "candidates": []}
-    if ch_primary:
-        fresh_choice = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: find_official_website(
-                ch_primary, location, 8,
-                query_phones=query_phones,
-                registered_office_is_proxy=registered_office_is_proxy,
-            ),
-        )
-        fresh_best = fresh_choice.get("selected")
-        if fresh_best and (
-            not selected_site
-            or int(fresh_best.get("match_score") or 0) > int((selected_site or {}).get("match_score") or 0)
-        ):
-            selected_site = fresh_best
-            website_choice = fresh_choice
+    empty = {"selected": None, "candidates": []}
+    pending = [f for f in (pass1_fut, pass2_fut, pass3_fut) if f is not None]
+    gathered = await asyncio.gather(*pending, return_exceptions=True)
+    it = iter(gathered)
 
-    # Pass 3: if the user gave us a phone number, search for that exact phone.
-    # Whichever site lists it is overwhelmingly likely to be the real one.
-    phone_choice: Dict[str, Any] = {"selected": None, "candidates": []}
-    if query_phones:
-        phone_choice = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: find_website_by_phone(
-                query_phones, ch_primary, location, 10,
-                registered_office_is_proxy=registered_office_is_proxy,
-            ),
+    def _take(fut) -> Dict[str, Any]:
+        if fut is None:
+            return dict(empty)
+        val = next(it)
+        if isinstance(val, Exception):
+            logger.warning(f"website pick pass failed: {val}")
+            return dict(empty)
+        return val if isinstance(val, dict) else dict(empty)
+
+    website_choice = _take(pass1_fut)
+    fresh_choice = _take(pass2_fut)
+    phone_choice = _take(pass3_fut)
+
+    # Union all three passes by domain. For each domain, keep the candidate
+    # entry with the strongest evidence (highest match_score). The previous
+    # logic picked one winner per pass and then merged winners, which meant
+    # a domain that only appeared in pass 2 with a weaker text source could
+    # lose to a generic pass-1 hit — even if pass 3 would have rescored it
+    # higher with /contact text. Unioning lets the strongest evidence win.
+    pooled: Dict[str, Dict[str, Any]] = {}
+    for src_choice in (website_choice, fresh_choice, phone_choice):
+        for cand in (src_choice.get("candidates") or []):
+            dom = (cand.get("domain") or "").lower()
+            if not dom:
+                continue
+            existing = pooled.get(dom)
+            if existing is None or int(cand.get("match_score") or 0) > int(existing.get("match_score") or 0):
+                pooled[dom] = cand
+    pooled_list = sorted(
+        pooled.values(),
+        key=lambda c: (
+            1 if "query_phone_on_page" in (c.get("matches") or []) else 0,
+            int(c.get("match_score") or 0),
+        ),
+        reverse=True,
+    )
+
+    ai_rerank: Optional[Dict[str, Any]] = None
+    rerank_allowed = quality_mode in ("balanced", "high")
+    has_rerank_anchor = bool(ch_primary or query_phones)
+    if len(pooled_list) >= 2 and rerank_allowed and has_rerank_anchor:
+        ai_rerank = await run_ai_website_rerank(
+            query=query,
+            country_hint=location,
+            ch_record=ch_primary,
+            query_phones=query_phones,
+            candidates=pooled_list,
+            quality_mode=quality_mode,
         )
-        phone_best = phone_choice.get("selected")
-        if phone_best:
-            phone_score = int(phone_best.get("match_score") or 0)
-            current_score = int((selected_site or {}).get("match_score") or 0)
-            phone_confirmed = "query_phone_on_page" in (phone_best.get("matches") or [])
-            # A phone-confirmed page wins ties and beats anything within 20 points.
-            if not selected_site or phone_score > current_score or (phone_confirmed and phone_score + 20 >= current_score):
-                selected_site = phone_best
-                website_choice = phone_choice
+        if ai_rerank and ai_rerank.get("domain_scores"):
+            score_map = ai_rerank["domain_scores"]
+            for cand in pooled_list:
+                dom = str(cand.get("domain") or "").lower()
+                ai_score = score_map.get(dom)
+                if ai_score is None:
+                    continue
+                base = int(cand.get("composite_score") or cand.get("match_score") or 0)
+                blended = int(base * 0.65 + int(ai_score) * 0.35)
+                # Keep phone-confirmed winners stable unless AI is confident.
+                if "query_phone_on_page" in (cand.get("matches") or []) and int(ai_score) < 60:
+                    blended = base
+                cand["ai_rerank_score"] = int(ai_score)
+                cand["composite_score"] = blended
+
+            pooled_list = sorted(
+                pooled_list,
+                key=lambda c: (
+                    1 if "query_phone_on_page" in (c.get("matches") or []) else 0,
+                    int(c.get("composite_score") or c.get("match_score") or 0),
+                    int(c.get("match_score") or 0),
+                ),
+                reverse=True,
+            )
+
+        if ai_rerank:
+            record["validation_notes"].append(
+                f"AI website rerank used model {ai_rerank.get('model')} in {ai_rerank.get('quality_mode')} mode "
+                f"across {ai_rerank.get('candidate_count')} candidates"
+            )
+            if ai_rerank.get("reason"):
+                record["validation_notes"].append(
+                    "AI rerank rationale: " + str(ai_rerank.get("reason"))
+                )
+
+    selected_site = pooled_list[0] if pooled_list else None
+    if selected_site and int(selected_site.get("match_score") or 0) < WEBSITE_MIN_MATCH_SCORE:
+        # Even the union's best is below threshold — don't crown it.
+        selected_site = None
+
+    if ai_rerank and selected_site:
+        ai_selected = str(ai_rerank.get("selected_domain") or "").lower()
+        if ai_selected and ai_selected != str(selected_site.get("domain") or "").lower():
+            record["validation_notes"].append(
+                f"AI suggested {ai_selected} but rule-based ranking selected {selected_site.get('domain')}"
+            )
+
+    # Replace website_choice.candidates with the unioned ranked list so the
+    # downstream alternatives output reflects the merged view.
+    website_choice = {"selected": selected_site, "candidates": pooled_list}
 
     if selected_site:
         match_score = int(selected_site.get("match_score") or 0)
@@ -3805,6 +4303,10 @@ async def build_verified_b2b_record(query: str,
         if phone_confirmed:
             conf = min(99, conf + 10)
         notes = [f"validator score {match_score}/100"]
+        if selected_site.get("ai_rerank_score") is not None and ai_rerank:
+            notes.append(
+                f"ai rerank score {int(selected_site.get('ai_rerank_score') or 0)}/100 via {ai_rerank.get('model')}"
+            )
         if phone_confirmed:
             notes.append("query phone number found on page")
         if selected_site.get("matches"):
@@ -4178,7 +4680,7 @@ async def build_verified_b2b_record(query: str,
             f"Website {selected_site['domain']} chosen but failed strong validation (score {selected_site['match_score']}/100)")
 
     # ---- 11) AI business activity summary (specialist summarizer model) ----
-    summary_text = await run_ai_business_summary(record)
+    summary_text = await run_ai_business_summary(record, quality_mode=quality_mode)
     if summary_text:
         record["final_enrichment_summary"] = summary_text
 
@@ -4539,13 +5041,22 @@ async def list_models():
     return {
         "default": AI_MODEL,
         "summarizer": AI_MODEL_SUMMARIZER,
+        "summarizer_strong": AI_MODEL_SUMMARIZER_STRONG,
         "specialists": {
             "matcher": AI_MODEL_MATCHER,
+            "matcher_strong": AI_MODEL_MATCHER_STRONG,
             "validator": AI_MODEL_VALIDATOR,
+            "validator_strong": AI_MODEL_VALIDATOR_STRONG,
             "address": AI_MODEL_ADDRESS,
             "classifier": AI_MODEL_CLASSIFIER,
         },
         "allowed_for_request_override": AI_MODEL_ALLOWED,
+        "quality": {
+            "default": "balanced",
+            "allowed": list(QUALITY_MODES),
+            "ai_website_rerank_enabled": WEBSITE_AI_RERANK_ENABLED,
+            "ai_rerank_top_k": WEBSITE_AI_RERANK_TOP_K,
+        },
         "thinking": {
             "supported_prefixes": list(THINKING_MODEL_PREFIXES),
             "default_for_thinking_models": False,
@@ -4582,92 +5093,108 @@ async def enrich_single(request: EnrichRequest):
         chosen = resolve_request_model(getattr(request, "model", None))
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
-    if chosen:
-        _REQUEST_MODEL.set(chosen)
+
+    quality = str(getattr(request, "quality_mode", "balanced") or "balanced").strip().lower()
+    if quality not in QUALITY_MODES:
+        raise HTTPException(status_code=400, detail=f"quality_mode must be one of: {', '.join(QUALITY_MODES)}")
+
+    model_token = _REQUEST_MODEL.set(chosen) if chosen else None
     _think = getattr(request, "think", None)
-    if _think is not None:
-        _REQUEST_THINK.set(bool(_think))
-    if request.query:
-        return await crawl_businesses(
-            CrawlBusinessesRequest(
-                query=request.query,
-                location=request.location,
-                max_results=request.max_results,
-                model=request.model,
-                think=request.think,
-            )
-        )
+    think_token = _REQUEST_THINK.set(bool(_think)) if _think is not None else None
+    quality_token = _REQUEST_QUALITY.set(quality)
 
-    target_url = None
-
-    if request.domain:
-        target_url = request.domain if request.domain.startswith("http") else f"https://{request.domain}"
-    elif request.linkedin_url:
-        target_url = request.linkedin_url
-
-    # 1. Async Crawl
-    # We run crawl in executor too as requests/trafilatura is sync
-    loop = asyncio.get_event_loop()
-
-    # Fallback discovery when domain is not provided — search max_results domains.
-    if not target_url and request.company_name:
-        discovery_location = request.location or request.country
-        candidates = await loop.run_in_executor(
-            None,
-            discover_business_urls,
-            request.company_name,
-            discovery_location,
-            request.max_results,
-        )
-        if not candidates:
-            raise HTTPException(status_code=400, detail="Could not discover any URLs for the given company_name.")
-
-        # Multiple candidates discovered — enrich all of them like crawl-businesses.
-        if len(candidates) > 1:
+    try:
+        if request.query:
             return await crawl_businesses(
                 CrawlBusinessesRequest(
-                    query=request.company_name,
-                    location=discovery_location,
+                    query=request.query,
+                    location=request.location,
                     max_results=request.max_results,
                     model=request.model,
+                    think=request.think,
+                    quality_mode=request.quality_mode,
                 )
             )
 
-        target_url = candidates[0].get("url")
+        target_url = None
 
-    if not target_url:
-        raise HTTPException(status_code=400, detail="Could not resolve a target URL. Provide domain/linkedin_url or a company_name that can be discovered.")
+        if request.domain:
+            target_url = request.domain if request.domain.startswith("http") else f"https://{request.domain}"
+        elif request.linkedin_url:
+            target_url = request.linkedin_url
 
-    text_content = await loop.run_in_executor(None, clean_text_from_url, target_url)
-    
-    if not text_content:
-        raise HTTPException(status_code=400, detail="Could not extract content from resolved URL")
+        # 1. Async Crawl
+        # We run crawl in executor too as requests/trafilatura is sync
+        loop = asyncio.get_event_loop()
 
-    # 2. Async AI with hints
-    hints = {
-        "company_name": request.company_name or "",
-        "phone_number": request.phone_number or "",
-        "location": request.location or "",
-        "country": request.country or "",
-        "industry_hint": request.industry_hint or "",
-        "linkedin_url": request.linkedin_url or "",
-        "additional_context": request.additional_context or "",
-    }
-    ai_data = await run_ai_extraction(text_content, hints=hints)
-    
-    if not ai_data:
-        ai_data = {"error": "AI processing failed"}
-        confidence = {"overall": 0, "band": "low", "reasons": ["ai_failed"], "signals": {"email_count": 0, "phone_count": 0}}
-    else:
-        confidence = score_enrichment(ai_data, hints, text_content)
+        # Fallback discovery when domain is not provided — search max_results domains.
+        if not target_url and request.company_name:
+            discovery_location = request.location or request.country
+            candidates = await loop.run_in_executor(
+                None,
+                discover_business_urls,
+                request.company_name,
+                discovery_location,
+                request.max_results,
+            )
+            if not candidates:
+                raise HTTPException(status_code=400, detail="Could not discover any URLs for the given company_name.")
 
-    return {
-        "domain": request.domain,
-        "resolved_url": target_url,
-        "enrichment": ai_data,
-        "confidence": confidence,
-        "processing_model": get_main_model()
-    }
+            # Multiple candidates discovered — enrich all of them like crawl-businesses.
+            if len(candidates) > 1:
+                return await crawl_businesses(
+                    CrawlBusinessesRequest(
+                        query=request.company_name,
+                        location=discovery_location,
+                        max_results=request.max_results,
+                        model=request.model,
+                        think=request.think,
+                        quality_mode=request.quality_mode,
+                    )
+                )
+
+            target_url = candidates[0].get("url")
+
+        if not target_url:
+            raise HTTPException(status_code=400, detail="Could not resolve a target URL. Provide domain/linkedin_url or a company_name that can be discovered.")
+
+        text_content = await loop.run_in_executor(None, clean_text_from_url, target_url)
+
+        if not text_content:
+            raise HTTPException(status_code=400, detail="Could not extract content from resolved URL")
+
+        # 2. Async AI with hints
+        hints = {
+            "company_name": request.company_name or "",
+            "phone_number": request.phone_number or "",
+            "location": request.location or "",
+            "country": request.country or "",
+            "industry_hint": request.industry_hint or "",
+            "linkedin_url": request.linkedin_url or "",
+            "additional_context": request.additional_context or "",
+        }
+        ai_data = await run_ai_extraction(text_content, hints=hints)
+
+        if not ai_data:
+            ai_data = {"error": "AI processing failed"}
+            confidence = {"overall": 0, "band": "low", "reasons": ["ai_failed"], "signals": {"email_count": 0, "phone_count": 0}}
+        else:
+            confidence = score_enrichment(ai_data, hints, text_content)
+
+        return {
+            "domain": request.domain,
+            "resolved_url": target_url,
+            "enrichment": ai_data,
+            "confidence": confidence,
+            "processing_model": get_main_model(),
+            "quality_mode": get_quality_mode(),
+        }
+    finally:
+        _REQUEST_QUALITY.reset(quality_token)
+        if think_token is not None:
+            _REQUEST_THINK.reset(think_token)
+        if model_token is not None:
+            _REQUEST_MODEL.reset(model_token)
 
 @app.post("/batch-enrich", tags=["Enrichment"])
 async def batch_enrich(request: BatchEnrichRequest):
@@ -4782,13 +5309,25 @@ async def crawl_businesses(request: CrawlBusinessesRequest):
     token = _REQUEST_MODEL.set(chosen) if chosen else None
     _think = getattr(request, "think", None)
     think_token = _REQUEST_THINK.set(bool(_think)) if _think is not None else None
+    quality = (getattr(request, "quality_mode", "balanced") or "balanced").strip().lower()
+    if quality not in QUALITY_MODES:
+        quality = "balanced"
+
+    discovery_cap = request.max_results
+    if quality == "high":
+        # In high mode, crawl a deeper candidate set to improve recall.
+        discovery_cap = min(50, max(request.max_results + 4, int(request.max_results * 1.8)))
+    elif quality == "fast":
+        discovery_cap = max(1, min(request.max_results, 8))
+
     try:
         candidates = await asyncio.get_event_loop().run_in_executor(
             None,
             discover_business_urls,
             request.query,
             request.location,
-            request.max_results,
+            discovery_cap,
+            quality,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Discovery failed: {e}")
@@ -4842,7 +5381,11 @@ async def crawl_businesses(request: CrawlBusinessesRequest):
 
         # Skip heavy AI extraction for known aggregator/directory/search pages.
         # These rarely represent the target business and mostly add latency.
-        ai_data = None if is_aggregator else await run_ai_extraction(text, hints=hints)
+        ai_data = None if is_aggregator else await run_ai_extraction(
+            text,
+            hints=hints,
+            quality_mode=quality,
+        )
         companies_house = shared_companies_house
 
         if companies_house and isinstance(companies_house, dict):
@@ -4951,6 +5494,7 @@ async def crawl_businesses(request: CrawlBusinessesRequest):
     try:
         verified_record = await build_verified_b2b_record(
             request.query, request.location, results, overall_summary,
+            quality_mode=quality,
         )
         overall_summary["verified_record"] = verified_record
     except Exception as e:
@@ -4968,12 +5512,19 @@ async def crawl_businesses(request: CrawlBusinessesRequest):
             "default": AI_MODEL,
             "active": get_main_model(),
             "matcher": AI_MODEL_MATCHER,
+            "matcher_strong": AI_MODEL_MATCHER_STRONG,
+            "active_matcher": get_matcher_model(quality),
             "validator": AI_MODEL_VALIDATOR,
+            "validator_strong": AI_MODEL_VALIDATOR_STRONG,
+            "active_validator": get_validator_model(quality),
             "address": AI_MODEL_ADDRESS,
             "classifier": AI_MODEL_CLASSIFIER,
             "summarizer": get_summarizer_model(),
+            "summarizer_strong": AI_MODEL_SUMMARIZER_STRONG,
+            "active_summarizer": get_summarizer_model(quality),
             "allowed_for_request_override": AI_MODEL_ALLOWED,
         },
+        "quality_mode": quality,
         "overall_summary": overall_summary,
         "verified_record": verified_record,
     }
@@ -5009,6 +5560,7 @@ async def enrich_verified_endpoint(request: CrawlBusinessesRequest):
         "query": request.query,
         "location": request.location,
         "models": full.get("models"),
+        "quality_mode": full.get("quality_mode"),
         "domains_scanned": full.get("domains_scanned"),
         "verified_record": record,
     }
@@ -5038,12 +5590,15 @@ User=$APP_USER
 Group=$APP_USER
 WorkingDirectory=$APP_DIR/app
 Environment="PATH=$VENV_DIR/bin"
-Environment="AI_MODEL_NAME=$SELECTED_MODEL"
-Environment="AI_MODEL_MATCHER=${AI_MODEL_MATCHER:-$SPECIALIST_MODEL_DEFAULT}"
-Environment="AI_MODEL_VALIDATOR=${AI_MODEL_VALIDATOR:-$SPECIALIST_MODEL_DEFAULT}"
+Environment="AI_MODEL_NAME=${AI_MODEL_NAME:-qwen3:32b}"
+Environment="AI_MODEL_MATCHER=${AI_MODEL_MATCHER:-qwen3:32b}"
+Environment="AI_MODEL_MATCHER_STRONG=${AI_MODEL_MATCHER_STRONG:-qwen2.5:72b}"
+Environment="AI_MODEL_VALIDATOR=${AI_MODEL_VALIDATOR:-qwen3:32b}"
+Environment="AI_MODEL_VALIDATOR_STRONG=${AI_MODEL_VALIDATOR_STRONG:-qwen2.5:72b}"
 Environment="AI_MODEL_ADDRESS=${AI_MODEL_ADDRESS:-$SPECIALIST_MODEL_DEFAULT}"
 Environment="AI_MODEL_CLASSIFIER=${AI_MODEL_CLASSIFIER:-$SPECIALIST_MODEL_DEFAULT}"
-Environment="AI_MODEL_SUMMARIZER=${AI_MODEL_SUMMARIZER:-$SELECTED_MODEL}"
+Environment="AI_MODEL_SUMMARIZER=${AI_MODEL_SUMMARIZER:-mistral-small:24b}"
+Environment="AI_MODEL_SUMMARIZER_STRONG=${AI_MODEL_SUMMARIZER_STRONG:-qwen3:32b}"
 Environment="COMPANIES_HOUSE_API_KEY=${COMPANIES_HOUSE_API_KEY:-}"
 Environment="OLLAMA_NUM_PARALLEL=$OLLAMA_NUM_PARALLEL"
 Environment="OLLAMA_KEEP_ALIVE=-1"
@@ -5075,12 +5630,16 @@ else
     # Kill any existing instance
     pkill -f "uvicorn main:app" 2>/dev/null || true
     cd $APP_DIR/app
-    export AI_MODEL_NAME=$SELECTED_MODEL
-    export AI_MODEL_MATCHER=${AI_MODEL_MATCHER:-$SPECIALIST_MODEL_DEFAULT}
-    export AI_MODEL_VALIDATOR=${AI_MODEL_VALIDATOR:-$SPECIALIST_MODEL_DEFAULT}
+    export AI_MODEL_NAME=${AI_MODEL_NAME:-qwen3:32b}
+    export AI_MODEL_MATCHER=${AI_MODEL_MATCHER:-qwen3:32b}
+    export AI_MODEL_MATCHER_STRONG=${AI_MODEL_MATCHER_STRONG:-qwen2.5:72b}
+    export AI_MODEL_VALIDATOR=${AI_MODEL_VALIDATOR:-qwen3:32b}
+    export AI_MODEL_VALIDATOR_STRONG=${AI_MODEL_VALIDATOR_STRONG:-qwen2.5:72b}
     export AI_MODEL_ADDRESS=${AI_MODEL_ADDRESS:-$SPECIALIST_MODEL_DEFAULT}
     export AI_MODEL_CLASSIFIER=${AI_MODEL_CLASSIFIER:-$SPECIALIST_MODEL_DEFAULT}
-    export AI_MODEL_SUMMARIZER=${AI_MODEL_SUMMARIZER:-$SELECTED_MODEL}
+    export AI_MODEL_SUMMARIZER=${AI_MODEL_SUMMARIZER:-mistral-small:24b}
+    export AI_MODEL_SUMMARIZER_STRONG=${AI_MODEL_SUMMARIZER_STRONG:-qwen3:32b}
+    export AI_MODEL_ALLOWED=${AI_MODEL_ALLOWED:-qwen3:32b,qwen2.5:72b,mistral-small:24b,qwen2.5:32b,llama3.1:8b}
     export COMPANIES_HOUSE_API_KEY=${COMPANIES_HOUSE_API_KEY:-}
     export OLLAMA_NUM_PARALLEL=$OLLAMA_NUM_PARALLEL
     export OLLAMA_SCHED_SPREAD=$OLLAMA_SCHED_SPREAD
