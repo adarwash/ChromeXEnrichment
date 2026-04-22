@@ -2403,27 +2403,32 @@ def find_official_website(ch_record: Dict[str, Any],
         queries.insert(0, f'"{legal_name}" {country_hint}')
 
     seen: Dict[str, Dict[str, str]] = {}
-    for q in queries:
+    aggregator_markers = ("linkedin.com", "facebook.com", "twitter.com",
+                          "yelp.com", "yell.com", "google.com",
+                          "find-and-update.company-information.service.gov.uk")
+
+    def _run_query(q: str):
         try:
-            for hit in search_public_results(q, max_candidates):
+            return q, search_public_results(q, max_candidates)
+        except Exception as e:
+            logger.warning(f"Official-site search failed for '{q}': {e}")
+            return q, []
+
+    with ThreadPoolExecutor(max_workers=min(4, max(1, len(queries)))) as executor:
+        for _q, hits in executor.map(_run_query, queries):
+            for hit in hits:
                 domain = hit.get("domain") or ""
                 if not domain or domain in seen:
                     continue
                 if is_junk_website_domain(domain) or is_formations_agent_domain(domain):
                     continue
-                # Skip well-known aggregator domains using the same list as the crawler.
-                aggregator_markers = ("linkedin.com", "facebook.com", "twitter.com",
-                                      "yelp.com", "yell.com", "google.com",
-                                      "find-and-update.company-information.service.gov.uk")
                 if any(m in domain for m in aggregator_markers):
                     continue
                 seen[domain] = hit
                 if len(seen) >= max_candidates:
                     break
-        except Exception as e:
-            logger.warning(f"Official-site search failed for '{q}': {e}")
-        if len(seen) >= max_candidates:
-            break
+            if len(seen) >= max_candidates:
+                break
 
     candidates: List[Dict[str, Any]] = []
     for domain, hit in seen.items():
@@ -2514,9 +2519,18 @@ def find_website_by_phone(query_phones: List[Dict[str, Any]],
     seen: Dict[str, Dict[str, str]] = {}
     # Cap per-query results so one noisy query can't flood the pool.
     per_query_cap = max(3, max_candidates // 2)
-    for q in queries[:8]:
+    queries_to_run = queries[:8]
+
+    def _run_phone_query(q: str):
         try:
-            for hit in search_public_results(q, per_query_cap):
+            return q, search_public_results(q, per_query_cap)
+        except Exception as e:
+            logger.warning(f"Phone-based search failed for '{q}': {e}")
+            return q, []
+
+    with ThreadPoolExecutor(max_workers=min(4, max(1, len(queries_to_run)))) as executor:
+        for _q, hits in executor.map(_run_phone_query, queries_to_run):
+            for hit in hits:
                 domain = (hit.get("domain") or "").lower()
                 if not domain or domain in seen:
                     continue
@@ -2529,10 +2543,8 @@ def find_website_by_phone(query_phones: List[Dict[str, Any]],
                 seen[domain] = hit
                 if len(seen) >= max_candidates:
                     break
-        except Exception as e:
-            logger.warning(f"Phone-based search failed for '{q}': {e}")
-        if len(seen) >= max_candidates:
-            break
+            if len(seen) >= max_candidates:
+                break
 
     candidates: List[Dict[str, Any]] = []
     digit_variants = _phone_digit_variants(query_phones)
