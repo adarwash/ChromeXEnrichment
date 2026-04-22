@@ -212,7 +212,7 @@ cat > $APP_DIR/app/requirements.txt << 'REQEOF'
 fastapi==0.111.0
 uvicorn[standard]==0.30.1
 httpx==0.27.2
-pydantic==2.7.4
+pydantic>=2.9,<3.0
 phonenumbers==8.13.40
 email-validator==2.2.0
 trafilatura==1.8.0
@@ -346,7 +346,7 @@ Features:
 - **Overall summary** — cross-referenced B2B profile with Companies House priority, verified phones, domains_scanned
 - **Parallel processing** — concurrent AI inference, Companies House lookups, and page crawling
 """,
-    version="2.7.0"
+    version="2.8.2"
 )
 
 # --- Pydantic Models ---
@@ -1256,15 +1256,20 @@ def discover_business_urls(query: str, location: Optional[str], max_results: int
     seen_domains: set = set()
 
     # Multi-pass query strategy (de-dup'd, order matters: most-specific first):
-    # 1) original query (with phone) — can pin a directory listing exactly
-    # 2) cleaned company-name query (phone stripped) — avoids reverse-phone spam
+    # 1) cleaned company-name query (phone stripped) — primary; phone-bearing
+    #    queries from datacenter IPs almost exclusively return reverse-phone-
+    #    lookup directories (which we treat as junk anyway), wasting SERP
+    #    budget that DDG/Bing rate-limit aggressively.
+    # 2) original query (with phone) — only if cleaning yielded nothing
     # 3) quoted-name + "UK company" — surfaces Companies House / Endole / D&B
     #    listings which reliably link to the brand website even when general
     #    search engines miss it.
-    query_variants: List[str] = [search_query]
     cleaned = strip_phones_from_text(search_query)
+    query_variants: List[str] = []
     if cleaned and cleaned.lower() != search_query.lower():
         query_variants.append(cleaned)
+    else:
+        query_variants.append(search_query)
     # Build a quoted-name probe from the cleaned company name (or original if
     # cleaning produced nothing).
     name_for_quote = (cleaned or search_query).strip()
@@ -1286,6 +1291,10 @@ def discover_business_urls(query: str, location: Optional[str], max_results: int
             if domain in blocked_domains or domain.endswith(".bing.com") or domain.endswith(".yahoo.com"):
                 continue
             if "/aclick" in url.lower() or "trafficguard.ai" in url.lower():
+                continue
+            # Drop reverse-phone-lookup / scam-list / aggregator junk early so
+            # they don't consume the candidate cap and crowd out real sites.
+            if is_junk_website_domain(domain):
                 continue
             if domain in seen_domains:
                 continue
@@ -1419,6 +1428,34 @@ def _search_with_crawl4ai(query: str, max_results: int) -> List[Dict[str, str]]:
                 results.append({"title": link.get_text(" ", strip=True), "url": real, "domain": domain})
                 if len(results) >= max_results:
                     break
+        # Sanity filter: from datacenter IPs Bing sometimes ignores mkt/cc/setlang
+        # and serves geo-routed bot-detection content (e.g. zhihu.com / github.com
+        # ChatGPT pages) regardless of query. Drop hits whose title+url share no
+        # meaningful alphabetic token with the query. Skipped when the query has
+        # no usable alpha tokens (pure phone/number searches).
+        q_tokens = {t.lower() for t in re.findall(r"[A-Za-z]{4,}", query)}
+        # Strip very common stop-words so "official"/"site"/"contact" don't carry the match.
+        q_tokens -= {"official", "site", "contact", "website", "home", "about",
+                     "company", "limited", "corporation", "ltd", "plc", "llc", "llp"}
+        if q_tokens and results:
+            filtered = [
+                r for r in results
+                if any(t in ((r.get("title") or "").lower() + " " + (r.get("url") or "").lower())
+                       for t in q_tokens)
+            ]
+            if not filtered:
+                logger.warning(
+                    f"Crawl4AI SERP via {engine} returned {len(results)} hits but none "
+                    f"matched query tokens for '{query[:60]}' — discarding (likely bot-detect page)"
+                )
+                results = []
+            else:
+                if len(filtered) < len(results):
+                    logger.info(
+                        f"Crawl4AI SERP via {engine}: kept {len(filtered)}/{len(results)} hits "
+                        f"after token-overlap filter for '{query[:60]}'"
+                    )
+                results = filtered
         if results:
             logger.info(f"Crawl4AI SERP via {engine} returned {len(results)} for '{query[:60]}'")
             return results
@@ -1946,7 +1983,7 @@ def extract_address_candidates(text_content: str) -> List[str]:
     if not text_content:
         return []
 
-    street_token = r"(?:street|st|road|rd|avenue|ave|boulevard|blvd|lane|ln|drive|dr|way|court|ct|place|pl|parkway|pkwy|highway|hwy|terrace|ter|circle|cir|close|crescent|cres|mews|square|sq|business park|industrial estate)"
+    street_token = r"(?:street|st|road|rd|avenue|ave|boulevard|blvd|lane|ln|drive|dr|way|court|ct|place|pl|parkway|pkwy|highway|hwy|terrace|ter|circle|cir|close|crescent|cres|mews|square|sq|row|gardens|grove|hill|park|view|walk|wharf|yard|approach|rise|vale|business park|industrial estate)"
     unit_token = r"(?:suite|ste|unit|floor|fl|building|bldg|room|rm|office|dept|department|level)"
     us_zip_token = r"\d{5}(?:-\d{4})?"
     uk_postcode_token = r"[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}"
@@ -2432,6 +2469,199 @@ def address_match_signals(ch_address: Optional[str],
     }
 
 
+_HQ_LABEL_RE = re.compile(
+    r"\b(head\s*office|headquarters|main\s+office|registered\s+office|principal\s+office|hq)\b",
+    flags=re.IGNORECASE,
+)
+
+_ADDRESS_LABEL_RE = re.compile(
+    r"\b(address|head\s*office|headquarters|main\s+office|registered\s+office|principal\s+office|our\s+office|visit\s+us|find\s+us|location|hq)\b\s*[:\-]?\s*$",
+    flags=re.IGNORECASE | re.MULTILINE,
+)
+
+_POSTCODE_TOKEN_RE = re.compile(
+    r"\b(?:[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}|\d{5}(?:-\d{4})?)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def _label_driven_address_candidates(text: str) -> List[Dict[str, Any]]:
+    """Find address blocks that follow a label like 'Head Office', 'Address:',
+    'Visit us'. Many sites print the address as plain text under such a label
+    without any street-suffix keyword (e.g. 'Denise Coates Foundation Building,
+    Home Farm Drive, Keele, ST5 5NS'), which `extract_address_candidates` skips
+    because it requires a numbered-street pattern.
+
+    Returns a list of {address, is_main} dicts. is_main=True when the label
+    explicitly indicates a head / main / registered office.
+    """
+    if not text:
+        return []
+    out: List[Dict[str, Any]] = []
+    seen: set = set()
+    lines = text.splitlines()
+    label_re = re.compile(
+        r"^\s*(address|head\s*office|headquarters|main\s+office|registered\s+office|"
+        r"principal\s+office|our\s+office|visit\s+us|find\s+us|location|hq)\b\s*[:\-]?\s*$",
+        flags=re.IGNORECASE,
+    )
+    inline_label_re = re.compile(
+        r"^\s*(address|head\s*office|headquarters|main\s+office|registered\s+office|"
+        r"principal\s+office|our\s+office|visit\s+us|find\s+us|location|hq)\s*[:\-]\s*(.+)$",
+        flags=re.IGNORECASE,
+    )
+    for idx, line in enumerate(lines):
+        m = label_re.match(line)
+        inline_m = None if m else inline_label_re.match(line)
+        if not (m or inline_m):
+            continue
+        label_text = (m.group(1) if m else inline_m.group(1)).lower()
+        is_main = bool(re.search(r"head|hq|headquarters|main|registered|principal", label_text))
+        # Build candidate from following lines (or from inline tail) until we
+        # capture a postcode or run out of plausible lines.
+        if inline_m:
+            collected = [inline_m.group(2).strip()]
+            scan = lines[idx + 1: idx + 7]
+        else:
+            collected = []
+            scan = lines[idx + 1: idx + 8]
+        for nxt in scan:
+            nxt_strip = nxt.strip(" \t,;|-")
+            if not nxt_strip:
+                if collected:
+                    break
+                continue
+            if len(nxt_strip) > 140:
+                break
+            collected.append(nxt_strip)
+            if _POSTCODE_TOKEN_RE.search(nxt_strip):
+                break
+        if not collected:
+            continue
+        joined = normalize_address_text(", ".join(collected))
+        if not joined or not _POSTCODE_TOKEN_RE.search(joined):
+            continue
+        if len(joined) < 12 or len(joined) > 240:
+            continue
+        key = slugify_text(joined)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append({"address": joined, "is_main": is_main})
+    return out
+
+
+def extract_website_address(domain: str, country_hint: Optional[str]) -> Dict[str, Any]:
+    """Try to derive the company's primary postal address from its own website.
+
+    Strategy:
+      - Fetch homepage + common contact/about pages.
+      - Run extract_address_candidates over each page's text.
+      - Deduplicate by postcode (or line1 slug if no postcode parsed).
+      - If exactly one unique address is found, return it (label='website_single').
+      - If multiple addresses are found but exactly one appears within ~200
+        chars of a head-office/HQ/main-office label, return that one
+        (label='website_main').
+      - Otherwise return no address with label='website_ambiguous' so the
+        caller can fall back to the Companies House registered address.
+    """
+    if not domain:
+        return {"address": None, "candidates": [], "label": "website_none"}
+
+    pages: List[Dict[str, str]] = []
+    for path in ("", "/contact", "/contact-us", "/about", "/about-us"):
+        url = f"https://{domain}{path}"
+        try:
+            text = clean_text_from_url(url) or ""
+        except Exception:
+            text = ""
+        if text:
+            pages.append({"path": path or "/", "text": text})
+
+    if not pages:
+        return {"address": None, "candidates": [], "label": "website_none"}
+
+    seen_keys: set = set()
+    candidates: List[Dict[str, Any]] = []
+
+    for page in pages:
+        text = page["text"]
+        text_lower = text.lower()
+        # Path A: label-driven (catches addresses without numbered streets,
+        # e.g. 'Head Office\nDenise Coates Foundation Building, Home Farm
+        # Drive, Keele, ST5 5NS' or 'Head Office\n<addr>, B3 2AA').
+        for lab in _label_driven_address_candidates(text):
+            cand = lab["address"]
+            fields = parse_address_fields(cand, country_hint)
+            postcode = normalized_postcode(fields.get("postcode") or "")
+            line1_slug = slugify_text(fields.get("line1") or "")
+            key = postcode or line1_slug or slugify_text(cand)
+            if not key:
+                continue
+            if key in seen_keys:
+                if lab["is_main"]:
+                    for existing in candidates:
+                        if existing["key"] == key:
+                            existing["is_main"] = True
+                continue
+            seen_keys.add(key)
+            candidates.append({
+                "address": cand,
+                "key": key,
+                "is_main": lab["is_main"],
+                "path": page["path"],
+            })
+        # Path B: pattern-driven (numbered street + postcode).
+        for cand in extract_address_candidates(text):
+            fields = parse_address_fields(cand, country_hint)
+            postcode = normalized_postcode(fields.get("postcode") or "")
+            line1_slug = slugify_text(fields.get("line1") or "")
+            key = postcode or line1_slug or slugify_text(cand)
+            if not key:
+                continue
+            # Look for an HQ / head-office / main-office label near this
+            # candidate within the same page so we can promote it later.
+            probe = cand[:60].lower()
+            idx = text_lower.find(probe) if probe else -1
+            if idx < 0:
+                # Fallback: locate by postcode token (often more stable than
+                # the long candidate snippet).
+                if postcode:
+                    idx = text_lower.find(postcode.lower())
+            if idx >= 0:
+                window = text[max(0, idx - 240): idx + len(cand) + 60]
+                is_main = bool(_HQ_LABEL_RE.search(window))
+            else:
+                is_main = False
+
+            if key in seen_keys:
+                if is_main:
+                    for existing in candidates:
+                        if existing["key"] == key:
+                            existing["is_main"] = True
+                continue
+            seen_keys.add(key)
+            candidates.append({
+                "address": cand,
+                "key": key,
+                "is_main": is_main,
+                "path": page["path"],
+            })
+
+    if not candidates:
+        return {"address": None, "candidates": [], "label": "website_none"}
+
+    addresses = [c["address"] for c in candidates]
+    if len(candidates) == 1:
+        return {"address": candidates[0]["address"], "candidates": addresses, "label": "website_single"}
+
+    main_only = [c for c in candidates if c["is_main"]]
+    if len(main_only) == 1:
+        return {"address": main_only[0]["address"], "candidates": addresses, "label": "website_main"}
+
+    return {"address": None, "candidates": addresses, "label": "website_ambiguous"}
+
+
 def website_company_match_score(ch_record: Optional[Dict[str, Any]],
                                 website_text: str,
                                 website_domain: str,
@@ -2825,10 +3055,49 @@ def find_official_website(ch_record: Dict[str, Any],
     if country_hint:
         queries.insert(0, f'"{legal_name}" {country_hint}')
 
+    # Director-anchored probe: many brand-website-vs-legal-name mismatches
+    # (e.g. "LUXURY HOLIDAYS AND HONEYMOONS LTD" trading as luxurycottages.com)
+    # only resolve when we search by the active director's name. Use the most
+    # recently appointed director if available.
+    directors_list = ch_record.get("directors") or []
+    if directors_list:
+        for d in directors_list[:2]:
+            raw_name = (d or {}).get("name") if isinstance(d, dict) else None
+            if not raw_name:
+                continue
+            n = str(raw_name).strip()
+            # Companies House serialises directors as "SURNAME, Forename Middle"
+            if "," in n:
+                last, _, rest = n.partition(",")
+                first_parts = rest.strip().split()
+                if first_parts and last.strip():
+                    director_full = f"{first_parts[0].title()} {last.strip().title()}"
+                else:
+                    continue
+            else:
+                parts = n.split()
+                if len(parts) < 2:
+                    continue
+                director_full = f"{parts[0].title()} {parts[-1].title()}"
+            anchor = short_name or legal_name
+            queries.append(f'"{director_full}" "{anchor}"')
+            if country_hint:
+                queries.append(f'"{director_full}" {country_hint}')
+
     seen: Dict[str, Dict[str, str]] = {}
-    aggregator_markers = ("linkedin.com", "facebook.com", "twitter.com",
-                          "yelp.com", "yell.com", "google.com",
-                          "find-and-update.company-information.service.gov.uk")
+    # Domains that never represent the company itself; reject early so they
+    # don't eat candidate slots when SERP coverage is sparse.
+    aggregator_markers = (
+        "linkedin.com", "facebook.com", "twitter.com", "instagram.com",
+        "tiktok.com", "youtube.com",
+        "yelp.com", "yell.com", "google.com", "g.page",
+        "find-and-update.company-information.service.gov.uk",
+        "reverse-phone", "phonelookup", "whocalled", "whocallsme",
+        "tellows", "shouldianswer", "spokeo", "whitepages",
+        "searchyellowdirectory", "searchpeopledirectory",
+        "scamadviser", "419scam",
+        "bing.com", "msn.com",
+    )
 
     def _run_query(q: str):
         try:
@@ -3570,9 +3839,65 @@ async def build_verified_b2b_record(query: str,
             record["mismatch_warnings"].append(
                 f"website: best candidate scored {alt[0]['match_score']}/100 (below threshold {WEBSITE_MIN_MATCH_SCORE})")
 
-    # ---- 4) Verified address: cross-check CH against summary/web evidence ----
+    # ---- 4) Verified address ----
+    # Priority order:
+    #   1. Address extracted directly from the validated likely_website
+    #      (when the site lists exactly one address, OR multiple addresses
+    #      with one clearly labelled as head office / HQ / main office).
+    #   2. Companies House cross-referenced against general web evidence.
+    #   3. Companies House alone.
+    #   4. Web cross-reference (when there is no Companies House record).
+    # If the website lists multiple addresses with no clear main office, we
+    # deliberately ignore the website and fall back to Companies House.
+    website_addr_result: Dict[str, Any] = {"address": None, "candidates": [], "label": "website_none"}
+    if selected_site and selected_site.get("domain"):
+        try:
+            website_addr_result = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: extract_website_address(selected_site["domain"], location)
+            )
+        except Exception as e:
+            logger.warning(f"Website address extraction failed for {selected_site.get('domain')}: {e}")
+
+    website_addr = website_addr_result.get("address")
+    website_label = website_addr_result.get("label")
+    website_candidates_found = website_addr_result.get("candidates") or []
+
+    verified_address_set = False
+    if website_addr:
+        notes: List[str] = []
+        if website_label == "website_single":
+            src = "official_website"
+            notes.append("only address found on website")
+        else:  # website_main
+            src = "official_website+main_office_label"
+            notes.append("selected as main/head office on website")
+        conf = SOURCE_CONFIDENCE["official_website"]
+        if record["registered_address"]:
+            ch_addr_value = record["registered_address"]["value"]
+            signals = address_match_signals(ch_addr_value, website_addr, location)
+            if signals["same_postcode"] or signals["same_line1"]:
+                notes.append("matches Companies House registered address")
+                conf = min(99, SOURCE_CONFIDENCE["official_website"] + 10)
+            elif signals["conflict"]:
+                notes.append("differs from Companies House registered address")
+                conf = max(40, SOURCE_CONFIDENCE["official_website"] - 5)
+                record["mismatch_warnings"].append(
+                    f"address: website '{website_addr}' differs from Companies House '{ch_addr_value}'")
+            elif registered_office_is_proxy:
+                notes.append("Companies House registered office is a shared/proxy address; website address used instead")
+                conf = min(99, SOURCE_CONFIDENCE["official_website"] + 5)
+        set_field("verified_address", field_record(website_addr, src, conf, notes=notes))
+        verified_fields = parse_address_fields(website_addr, location)
+        if any(bool(v) for v in verified_fields.values()):
+            record["verified_address_fields"] = verified_fields
+        verified_address_set = True
+    elif website_label == "website_ambiguous":
+        record["validation_notes"].append(
+            f"website lists {len(website_candidates_found)} different addresses with no clear main office; "
+            f"falling back to Companies House registered address")
+
     summary_addr = overall_summary.get("verified_address") or overall_summary.get("address")
-    if record["registered_address"] and summary_addr:
+    if not verified_address_set and record["registered_address"] and summary_addr:
         ch_addr_value = record["registered_address"]["value"]
         signals = address_match_signals(ch_addr_value, summary_addr, location)
         if signals["same_postcode"] or signals["same_line1"]:
@@ -3606,7 +3931,7 @@ async def build_verified_b2b_record(query: str,
             verified_fields = parse_address_fields(ch_addr_value, location)
             if any(bool(v) for v in verified_fields.values()):
                 record["verified_address_fields"] = verified_fields
-    elif record["registered_address"]:
+    elif not verified_address_set and record["registered_address"]:
         set_field("verified_address", field_record(
             record["registered_address"]["value"], "companies_house",
             SOURCE_CONFIDENCE["companies_house"] - 8,
@@ -3614,7 +3939,7 @@ async def build_verified_b2b_record(query: str,
         verified_fields = parse_address_fields(record["registered_address"]["value"], location)
         if any(bool(v) for v in verified_fields.values()):
             record["verified_address_fields"] = verified_fields
-    elif summary_addr:
+    elif not verified_address_set and summary_addr:
         # No CH record; rely on cross-referenced web evidence.
         set_field("verified_address", field_record(
             summary_addr, "cross_referenced",
@@ -3783,23 +4108,33 @@ async def build_verified_b2b_record(query: str,
             "Email discovery skipped: no validated official website")
 
     # ---- 7) Industry / sector via AI on best result ----
+    # Only trust AI-inferred industry from the validated official website. Pulling
+    # it from any candidate (e.g. a phone-lookup directory or unrelated page that
+    # leaked into the candidate set) gives misleading results.
     best_ai = None
-    for item in successful:
-        enr = item.get("enrichment") or {}
-        if isinstance(enr, dict) and enr.get("industry"):
-            best_ai = enr
-            break
+    if site_domain:
+        for item in successful:
+            if normalize_domain(item.get("domain") or "") != site_domain:
+                continue
+            enr = item.get("enrichment") or {}
+            if isinstance(enr, dict) and enr.get("industry"):
+                best_ai = enr
+                break
     if best_ai:
         set_field("industry", field_record(
             best_ai.get("industry"), "ai_inferred",
             SOURCE_CONFIDENCE["ai_inferred"] + 10,
-            notes=["extracted from website text by local model"]))
+            notes=[f"extracted from {site_domain} by local model"]))
 
     # ---- 8) Trading name vs registered name ----
-    if record["matched_company"]:
+    # Same gating: only consider company_name extracted from the validated official
+    # website. Otherwise we hallucinate trading names from unrelated pages.
+    if record["matched_company"] and site_domain:
         legal = str(record["matched_company"]["value"])
         ai_name = ""
         for item in successful:
+            if normalize_domain(item.get("domain") or "") != site_domain:
+                continue
             cand = str(((item.get("enrichment") or {}).get("company_name") or "")).strip()
             if cand:
                 ai_name = cand
@@ -3810,7 +4145,7 @@ async def build_verified_b2b_record(query: str,
                 set_field("trading_name", field_record(
                     ai_name, "ai_inferred",
                     SOURCE_CONFIDENCE["ai_inferred"],
-                    notes=["differs from registered legal name"]))
+                    notes=[f"differs from registered legal name; from {site_domain}"]))
 
     # ---- 9) Social links ----
     social_links: Dict[str, str] = {}
@@ -4712,7 +5047,7 @@ Environment="AI_MODEL_SUMMARIZER=${AI_MODEL_SUMMARIZER:-$SELECTED_MODEL}"
 Environment="COMPANIES_HOUSE_API_KEY=${COMPANIES_HOUSE_API_KEY:-}"
 Environment="OLLAMA_NUM_PARALLEL=$OLLAMA_NUM_PARALLEL"
 Environment="OLLAMA_KEEP_ALIVE=-1"
-ExecStart=$VENV_DIR/bin/uvicorn main:app --host 0.0.0.0 --port $APP_PORT --workers 1
+ExecStart=$VENV_DIR/bin/uvicorn main:app --host 0.0.0.0 --port $APP_PORT --workers $OLLAMA_NUM_PARALLEL
 Restart=always
 RestartSec=10
 
@@ -4750,7 +5085,7 @@ else
     export OLLAMA_NUM_PARALLEL=$OLLAMA_NUM_PARALLEL
     export OLLAMA_SCHED_SPREAD=$OLLAMA_SCHED_SPREAD
     export OLLAMA_MAX_LOADED_MODELS=$OLLAMA_MAX_LOADED_MODELS
-    nohup $VENV_DIR/bin/uvicorn main:app --host 0.0.0.0 --port $APP_PORT --workers 1 > /var/log/ai-enrichment.log 2>&1 &
+    nohup $VENV_DIR/bin/uvicorn main:app --host 0.0.0.0 --port $APP_PORT --workers $OLLAMA_NUM_PARALLEL > /var/log/ai-enrichment.log 2>&1 &
     echo "[+] Service started (PID: $!). Log: /var/log/ai-enrichment.log"
 fi
 
