@@ -140,7 +140,7 @@ if [ "$AVAIL_DISK_GB" -lt 6 ]; then
     echo "[!] Critical Disk Space. Selecting tiny model: $SELECTED_MODEL"
 elif [ "$HAS_NVIDIA" = true ] && [ "$TOTAL_VRAM_MB" -gt 45000 ] && [ "$AVAIL_DISK_GB" -gt 20 ]; then
     # High-end multi-GPU box with enough disk for a larger model.
-    SELECTED_MODEL="mistral-small:24b"
+    SELECTED_MODEL="qwen3:32b"
     echo "[+] High-end GPU host detected. Selecting larger model: $SELECTED_MODEL"
 elif [ "$HAS_NVIDIA" = true ] && [ "$TOTAL_VRAM_MB" -gt 10000 ]; then
     # Good GPU (>=10GB VRAM)
@@ -159,11 +159,14 @@ fi
 # Specialist tasks (entity match / validation / classification) are much
 # faster on 8B while still accurate for structured extraction. Keep the final
 # narrative summarizer on the main selected model.
-if [ "$SELECTED_MODEL" = "mistral-small:24b" ]; then
-    SPECIALIST_MODEL_DEFAULT="llama3.1:8b"
-else
-    SPECIALIST_MODEL_DEFAULT="$SELECTED_MODEL"
-fi
+case "$SELECTED_MODEL" in
+    qwen3:32b|mistral-small:24b|qwen2.5:32b)
+        SPECIALIST_MODEL_DEFAULT="llama3.1:8b"
+        ;;
+    *)
+        SPECIALIST_MODEL_DEFAULT="$SELECTED_MODEL"
+        ;;
+esac
 
 echo "[*] Pulling AI Model: $SELECTED_MODEL (This may take time...)"
 ollama pull $SELECTED_MODEL
@@ -172,8 +175,26 @@ if [ "$SPECIALIST_MODEL_DEFAULT" != "$SELECTED_MODEL" ]; then
     ollama pull $SPECIALIST_MODEL_DEFAULT
 fi
 
+# Optional alternative reasoners the API can switch to per-request via
+# {"model": "<name>"}. Only pre-pulled on hosts with enough VRAM/disk.
+ALT_MODELS="$SELECTED_MODEL"
+if [ "$HAS_NVIDIA" = true ] && [ "$TOTAL_VRAM_MB" -gt 45000 ] && [ "$AVAIL_DISK_GB" -gt 30 ]; then
+    for ALT_MODEL in qwen3:32b qwen2.5:32b mistral-small:24b; do
+        if [ "$ALT_MODEL" = "$SELECTED_MODEL" ]; then
+            continue
+        fi
+        echo "[*] Pulling Alternative Model: $ALT_MODEL (selectable per-request)"
+        if ollama pull $ALT_MODEL; then
+            ALT_MODELS="$ALT_MODELS,$ALT_MODEL"
+        else
+            echo "[!] Failed to pull $ALT_MODEL (continuing)"
+        fi
+    done
+fi
+
 # Set environment variable for the app to know which model is in use
 export AI_MODEL_NAME=$SELECTED_MODEL
+export AI_MODEL_ALLOWED=$ALT_MODELS
 
 # 4. Create Directory Structure
 echo "[*] Setting up directories..."
@@ -195,14 +216,20 @@ pydantic==2.7.4
 phonenumbers==8.13.40
 email-validator==2.2.0
 trafilatura==1.8.0
-ollama==0.2.1
+ollama>=0.6.1
 dnspython==2.6.1
 requests==2.32.3
 beautifulsoup4==4.12.3
+crawl4ai>=0.8.0
 REQEOF
 
 pip install --upgrade pip
 pip install -r $APP_DIR/app/requirements.txt
+
+# Install headless Chromium for Crawl4AI's JS-rendering fallback fetcher.
+echo "[*] Installing Playwright Chromium for Crawl4AI..."
+python3 -m playwright install chromium
+python3 -m playwright install-deps chromium || true
 
 # 7. FastAPI Application Code
 echo "[*] Writing Application Code..."
@@ -214,9 +241,11 @@ import re
 import time
 import html as html_lib
 import smtplib
+import contextvars
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, List, Dict, Any
-from urllib.parse import urlparse, parse_qs, unquote, urljoin
+from urllib.parse import urlparse, parse_qs, unquote, urljoin, quote_plus
 from pydantic import BaseModel, EmailStr, Field, model_validator
 from fastapi import FastAPI, HTTPException
 import requests
@@ -234,7 +263,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Get Model Name from Environment (set by installer)
-AI_MODEL = os.getenv("AI_MODEL_NAME", "mistral-small:24b")
+AI_MODEL = os.getenv("AI_MODEL_NAME", "qwen3:32b")
 # Task-specific local models. Default to AI_MODEL when not overridden so the
 # system works out of the box, but operators can point each specialist task at
 # a smaller/faster model (e.g. AI_MODEL_MATCHER=llama3.1:8b for entity match,
@@ -245,6 +274,63 @@ AI_MODEL_ADDRESS = os.getenv("AI_MODEL_ADDRESS", AI_MODEL)        # address comp
 AI_MODEL_CLASSIFIER = os.getenv("AI_MODEL_CLASSIFIER", AI_MODEL)  # industry / sector classification
 AI_MODEL_SUMMARIZER = os.getenv("AI_MODEL_SUMMARIZER", AI_MODEL)  # final business activity summary
 COMPANIES_HOUSE_API_KEY = os.getenv("COMPANIES_HOUSE_API_KEY", "").strip()
+
+# Models the API is allowed to switch to via the per-request `model` field.
+# Always includes AI_MODEL; installer adds extras like qwen2.5:32b on capable hosts.
+_allowed_raw = os.getenv("AI_MODEL_ALLOWED", AI_MODEL)
+AI_MODEL_ALLOWED = sorted({m.strip() for m in _allowed_raw.split(",") if m.strip()} | {AI_MODEL})
+
+# Per-request override of the main reasoner + summarizer. Set in endpoints.
+_REQUEST_MODEL: "contextvars.ContextVar[str | None]" = contextvars.ContextVar(
+    "request_model", default=None
+)
+
+# Per-request override for thinking/reasoning mode (qwen3, deepseek-r1, etc.).
+# None = use model default (off for known thinking models, see model_supports_thinking).
+_REQUEST_THINK: "contextvars.ContextVar[bool | None]" = contextvars.ContextVar(
+    "request_think", default=None
+)
+
+# Models known to support an Ollama `think` toggle. Defaults to OFF for latency
+# unless the caller passes `"think": true`.
+THINKING_MODEL_PREFIXES = ("qwen3", "deepseek-r1", "r1", "o1")
+
+def model_supports_thinking(model: str) -> bool:
+    m = (model or "").lower()
+    return any(m.startswith(p) or m == p for p in THINKING_MODEL_PREFIXES)
+
+def get_main_model() -> str:
+    """Return the active main reasoner model for the current request."""
+    return _REQUEST_MODEL.get() or AI_MODEL
+
+def get_summarizer_model() -> str:
+    """Return the active summarizer model. Per-request override wins."""
+    return _REQUEST_MODEL.get() or AI_MODEL_SUMMARIZER
+
+def chat_kwargs(model: str) -> Dict[str, Any]:
+    """Build kwargs for ollama.chat, including a `think` flag when the model
+    supports it. Per-request override (`_REQUEST_THINK`) wins; default is OFF
+    for thinking-capable models to keep latency predictable."""
+    kwargs: Dict[str, Any] = {}
+    if model_supports_thinking(model):
+        override = _REQUEST_THINK.get()
+        kwargs["think"] = bool(override) if override is not None else False
+    return kwargs
+
+def resolve_request_model(requested: Optional[str]) -> Optional[str]:
+    """Validate a per-request model override. Returns the model name to use,
+    or None to fall back to the configured default. Raises ValueError if the
+    requested model is not in the allow-list."""
+    if not requested:
+        return None
+    requested = requested.strip()
+    if not requested:
+        return None
+    if requested not in AI_MODEL_ALLOWED:
+        raise ValueError(
+            f"Model '{requested}' is not available. Allowed: {', '.join(AI_MODEL_ALLOWED)}"
+        )
+    return requested
 
 app = FastAPI(
     title="Chrome X AI Enrichment API",
@@ -276,6 +362,14 @@ class EnrichRequest(BaseModel):
     industry_hint: Optional[str] = None
     linkedin_url: Optional[str] = None
     additional_context: Optional[str] = None
+    model: Optional[str] = Field(
+        default=None,
+        description="Optional per-request override of the main reasoner model (must be in /models allow-list).",
+    )
+    think: Optional[bool] = Field(
+        default=None,
+        description="Toggle thinking/reasoning mode for thinking-capable models (qwen3, deepseek-r1). Default off for latency.",
+    )
 
     @model_validator(mode="after")
     def validate_identifiers(self):
@@ -318,6 +412,14 @@ class CrawlBusinessesRequest(BaseModel):
     query: str = Field(..., description="Business type or keyword, e.g. 'HVAC companies'")
     location: Optional[str] = Field(default=None, description="Optional city/region/country")
     max_results: int = Field(default=10, ge=1, le=50)
+    model: Optional[str] = Field(
+        default=None,
+        description="Optional per-request override of the main reasoner model (must be in /models allow-list).",
+    )
+    think: Optional[bool] = Field(
+        default=None,
+        description="Toggle thinking/reasoning mode for thinking-capable models (qwen3, deepseek-r1). Default off for latency.",
+    )
 
 class SystemStatus(BaseModel):
     status: str
@@ -346,6 +448,49 @@ def fetch_html_from_url(url: str, allow_non_html: bool = False) -> Optional[str]
             return None
         return resp.text
     except Exception:
+        return None
+
+
+# Crawl4AI fallback fetcher. Used when the static `requests` path returns
+# nothing useful (no email/phone visible in HTML), which is typical for sites
+# that inject contact details via JavaScript.
+_CRAWL4AI_AVAILABLE = True
+_CRAWL4AI_DISABLED_UNTIL = 0.0
+
+def fetch_html_with_crawl4ai(url: str, timeout_s: int = 25) -> Optional[str]:
+    """Render `url` in headless Chromium via Crawl4AI and return the rendered
+    HTML. Returns None on any failure. Process-level circuit breaker trips on
+    repeated failures to avoid hanging the worker."""
+    global _CRAWL4AI_AVAILABLE, _CRAWL4AI_DISABLED_UNTIL
+    if not _CRAWL4AI_AVAILABLE:
+        return None
+    if time.time() < _CRAWL4AI_DISABLED_UNTIL:
+        return None
+    try:
+        from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
+    except Exception as e:
+        logger.warning(f"Crawl4AI import failed: {e}; disabling fallback")
+        _CRAWL4AI_AVAILABLE = False
+        return None
+
+    async def _run() -> Optional[str]:
+        browser_cfg = BrowserConfig(headless=True, verbose=False)
+        run_cfg = CrawlerRunConfig(page_timeout=timeout_s * 1000)
+        async with AsyncWebCrawler(config=browser_cfg) as crawler:
+            result = await crawler.arun(url=url, config=run_cfg)
+            if result and getattr(result, "success", False):
+                return getattr(result, "html", None) or getattr(result, "cleaned_html", None)
+            return None
+
+    try:
+        return asyncio.run(asyncio.wait_for(_run(), timeout=timeout_s + 5))
+    except RuntimeError:
+        # Already inside a running event loop (shouldn't happen from our
+        # executor threads, but guard anyway).
+        return None
+    except Exception as e:
+        logger.warning(f"Crawl4AI fetch failed for {url}: {e}")
+        _CRAWL4AI_DISABLED_UNTIL = time.time() + 120
         return None
 
 
@@ -1003,9 +1148,11 @@ async def run_ai_extraction(text_content: str, hints: Optional[Dict[str, str]] =
     loop = asyncio.get_event_loop()
     try:
         # Run synchronous ollama call in a thread executor
+        _model = get_main_model()
+        _kw = chat_kwargs(_model)
         response = await loop.run_in_executor(
-            None, 
-            lambda: ollama.chat(model=AI_MODEL, messages=[{'role': 'user', 'content': prompt}], format='json')
+            None,
+            lambda: ollama.chat(model=_model, messages=[{'role': 'user', 'content': prompt}], format='json', **_kw)
         )
         content = response['message']['content']
         parsed = json.loads(content)
@@ -1044,17 +1191,43 @@ def check_smtp_connection(email: str):
 
 def clean_text_from_url(url: str):
     html = fetch_html_from_url(url)
-    if not html:
-        return None
+    text: Optional[str] = None
+    if html:
+        try:
+            extracted = trafilatura.extract(html, include_comments=False)
+            if extracted:
+                text = extracted
+        except Exception:
+            pass
+        if text is None:
+            text = html_to_text(html)
 
-    try:
-        extracted = trafilatura.extract(html, include_comments=False)
-        if extracted:
-            return extracted
-    except Exception:
-        pass
+    # If the static fetch produced nothing useful (no email and no phone-shaped
+    # digit run), retry with Crawl4AI's headless-browser renderer. This catches
+    # JS-injected contact details that `requests`+`trafilatura` can't see.
+    if not _text_has_contact_signals(text):
+        rendered = fetch_html_with_crawl4ai(url)
+        if rendered:
+            try:
+                extracted = trafilatura.extract(rendered, include_comments=False)
+                if extracted and _text_has_contact_signals(extracted):
+                    return extracted
+            except Exception:
+                pass
+            rendered_text = html_to_text(rendered)
+            if _text_has_contact_signals(rendered_text):
+                return rendered_text
+    return text
 
-    return html_to_text(html)
+
+def _text_has_contact_signals(text: Optional[str]) -> bool:
+    if not text:
+        return False
+    if "@" in text and re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text):
+        return True
+    if re.search(r"\+?\d[\d\s().-]{7,}\d", text):
+        return True
+    return False
 
 
 def parse_ddg_result_url(href: str) -> str:
@@ -1082,13 +1255,27 @@ def discover_business_urls(query: str, location: Optional[str], max_results: int
     candidates: List[Dict[str, str]] = []
     seen_domains: set = set()
 
-    # Two-pass query strategy:
-    # 1) original query (can include phone)
-    # 2) cleaned company-name query (phone removed) to avoid reverse-phone/ad spam
+    # Multi-pass query strategy (de-dup'd, order matters: most-specific first):
+    # 1) original query (with phone) — can pin a directory listing exactly
+    # 2) cleaned company-name query (phone stripped) — avoids reverse-phone spam
+    # 3) quoted-name + "UK company" — surfaces Companies House / Endole / D&B
+    #    listings which reliably link to the brand website even when general
+    #    search engines miss it.
     query_variants: List[str] = [search_query]
     cleaned = strip_phones_from_text(search_query)
     if cleaned and cleaned.lower() != search_query.lower():
         query_variants.append(cleaned)
+    # Build a quoted-name probe from the cleaned company name (or original if
+    # cleaning produced nothing).
+    name_for_quote = (cleaned or search_query).strip()
+    # Drop any trailing location token we appended above so the quoted phrase
+    # is just the company name.
+    if location and name_for_quote.lower().endswith(location.strip().lower()):
+        name_for_quote = name_for_quote[: -len(location.strip())].strip()
+    if name_for_quote and len(name_for_quote.split()) >= 2:
+        quoted = f'"{name_for_quote}" UK company'
+        if quoted.lower() not in {v.lower() for v in query_variants}:
+            query_variants.append(quoted)
 
     for q in query_variants:
         for item in search_public_results(q, max_results * 3):
@@ -1110,23 +1297,253 @@ def discover_business_urls(query: str, location: Optional[str], max_results: int
 
 
 _DDG_DISABLED_UNTIL = 0.0  # process-level circuit breaker; epoch seconds
+_BRAVE_DISABLED_UNTIL = 0.0
+_BING_DISABLED_UNTIL = 0.0
+_YAHOO_DISABLED_UNTIL = 0.0
+_MOJEEK_DISABLED_UNTIL = 0.0
+_BRAVE_LOCK = threading.Lock()
+_BRAVE_LAST_CALL = 0.0
+_BRAVE_MIN_SPACING = 1.1  # seconds between Brave requests to dodge 429s
+_BROWSER_SEARCH_DISABLED_UNTIL = 0.0
 
 def search_public_results(query: str, max_results: int) -> List[Dict[str, str]]:
     """Search public web results, falling back across providers when one is
-    rate-limited or returns nothing. Currently: DuckDuckGo HTML → Yahoo HTML
-    redirects → Bing HTML.
+    rate-limited or returns nothing.
 
-    DuckDuckGo is skipped (circuit-broken) for 5 minutes after a failure,
-    because in some hosting environments DDG is blocked and waiting on its
-    connect timeout dominates total request latency.
+    Order: Mojeek -> Brave Search HTML -> DuckDuckGo HTML -> Yahoo HTML -> Bing HTML
+    -> Crawl4AI-rendered Bing/DDG (last resort, slow but bypasses UA/JS gates
+    that block our datacenter IP across all the static-HTTP backends).
+    Each provider gets a process-level circuit breaker on failure to avoid
+    paying connect timeouts repeatedly.
     """
+    global _BRAVE_DISABLED_UNTIL, _BING_DISABLED_UNTIL, _YAHOO_DISABLED_UNTIL, _MOJEEK_DISABLED_UNTIL, _BROWSER_SEARCH_DISABLED_UNTIL
     results: List[Dict[str, str]] = []
-    if time.time() >= _DDG_DISABLED_UNTIL:
+    if time.time() >= _MOJEEK_DISABLED_UNTIL:
+        results = _search_mojeek(query, max_results)
+    if not results and time.time() >= _BRAVE_DISABLED_UNTIL:
+        results = _search_brave(query, max_results)
+    if not results and time.time() >= _DDG_DISABLED_UNTIL:
         results = _search_duckduckgo(query, max_results)
-    if not results:
+    if not results and time.time() >= _YAHOO_DISABLED_UNTIL:
         results = _search_yahoo(query, max_results)
-    if not results:
+    if not results and time.time() >= _BING_DISABLED_UNTIL:
         results = _search_bing(query, max_results)
+    if not results and time.time() >= _BROWSER_SEARCH_DISABLED_UNTIL:
+        results = _search_with_crawl4ai(query, max_results)
+    return results
+
+
+def _decode_bing_redirect(href: str) -> str:
+    """Bing wraps every organic result in https://www.bing.com/ck/a?...&u=a1<base64>&...
+    Decode the `u` param (strip leading `a1` tag, urlsafe-base64-decode) to get
+    the real destination URL. Returns the input unchanged if it isn't a ck/a
+    redirect or decoding fails."""
+    if "bing.com/ck/a" not in href.lower():
+        return href
+    try:
+        q = parse_qs(urlparse(href).query)
+        u = (q.get("u") or [""])[0]
+        if not u:
+            return ""
+        if u.startswith("a1"):
+            u = u[2:]
+        # urlsafe base64, padding-tolerant
+        pad = "=" * (-len(u) % 4)
+        import base64 as _b64
+        decoded = _b64.urlsafe_b64decode((u + pad).encode("ascii")).decode("utf-8", errors="replace")
+        return decoded if decoded.startswith("http") else ""
+    except Exception:
+        return ""
+
+
+def _search_with_crawl4ai(query: str, max_results: int) -> List[Dict[str, str]]:
+    """Last-resort SERP fetcher: render Bing (then DuckDuckGo HTML) in headless
+    Chromium via Crawl4AI. This bypasses UA/JS challenges that block all the
+    static-HTTP backends from datacenter IPs. Slow (~5-15s/query) but reliable.
+    """
+    global _BROWSER_SEARCH_DISABLED_UNTIL
+    if not _CRAWL4AI_AVAILABLE:
+        return []
+    # DDG first: from datacenter IPs, Bing's geo-routing serves wildly
+    # off-topic results (Mont Blanc / Chinese Q&A) for UK-business queries,
+    # while DDG with kl=uk-en consistently surfaces UK company directories
+    # and the actual brand websites.
+    targets = [
+        ("ddg",  f"https://duckduckgo.com/html/?q={quote_plus(query)}&kl=uk-en"),
+        ("bing", f"https://www.bing.com/search?q={quote_plus(query)}&count={max(10, max_results)}&cc=GB&setlang=en-GB&mkt=en-GB"),
+    ]
+    for engine, url in targets:
+        html = fetch_html_with_crawl4ai(url, timeout_s=20)
+        if not html:
+            continue
+        soup = BeautifulSoup(html, "html.parser")
+        results: List[Dict[str, str]] = []
+        seen: set = set()
+        if engine == "bing":
+            blocked = {"bing.com", "www.bing.com", "r.bing.com", "cn.bing.com", "go.microsoft.com"}
+            for li in soup.select("li.b_algo"):
+                a = li.select_one("h2 a") or li.select_one("a")
+                if not a:
+                    continue
+                href = a.get("href") or ""
+                if not href.startswith("http"):
+                    continue
+                # Bing wraps organic hits in /ck/a?...&u=a1<base64>... — decode.
+                if "bing.com/ck/a" in href.lower():
+                    href = _decode_bing_redirect(href)
+                    if not href:
+                        continue
+                domain = normalize_domain(href)
+                if not domain or domain in blocked or domain.endswith(".bing.com"):
+                    continue
+                key = href.lower().strip()
+                if key in seen:
+                    continue
+                seen.add(key)
+                results.append({"title": a.get_text(" ", strip=True), "url": href, "domain": domain})
+                if len(results) >= max_results:
+                    break
+        else:  # ddg
+            for link in soup.select("a.result__a"):
+                href = link.get("href", "")
+                real = parse_ddg_result_url(href)
+                if not real:
+                    continue
+                domain = normalize_domain(real)
+                if not domain or "duckduckgo.com" in domain:
+                    continue
+                key = real.lower().strip()
+                if key in seen:
+                    continue
+                seen.add(key)
+                results.append({"title": link.get_text(" ", strip=True), "url": real, "domain": domain})
+                if len(results) >= max_results:
+                    break
+        if results:
+            logger.info(f"Crawl4AI SERP via {engine} returned {len(results)} for '{query[:60]}'")
+            return results
+    # Both engines yielded nothing — short breaker so we don't keep paying ~30s per call.
+    _BROWSER_SEARCH_DISABLED_UNTIL = time.time() + 120
+    logger.warning(f"Crawl4AI SERP empty for '{query[:60]}' (disabled 2m)")
+    return []
+
+
+def _search_mojeek(query: str, max_results: int) -> List[Dict[str, str]]:
+    """Mojeek HTML scraper. Independent index, no rate limiting, returns clean
+    organic results from datacenter IPs. Used as the primary backend."""
+    global _MOJEEK_DISABLED_UNTIL
+    try:
+        resp = requests.get(
+            "https://www.mojeek.com/search",
+            params={"q": query},
+            timeout=(3, 10),
+            headers={
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                              "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Accept-Language": "en-GB,en;q=0.9",
+                "Accept": "text/html,application/xhtml+xml",
+            },
+        )
+        resp.raise_for_status()
+    except Exception as e:
+        _MOJEEK_DISABLED_UNTIL = time.time() + 300
+        logger.warning(f"Mojeek search failed for '{query[:60]}': {e} (disabled 5m)")
+        return []
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    results: List[Dict[str, str]] = []
+    seen: set = set()
+    for a in soup.select('a.title'):
+        href = a.get("href", "")
+        if not href.startswith("http"):
+            continue
+        domain = normalize_domain(href)
+        if not domain or "mojeek.com" in domain:
+            continue
+        key = href.lower().strip()
+        if key in seen:
+            continue
+        seen.add(key)
+        results.append({
+            "title": a.get_text(" ", strip=True),
+            "url": href,
+            "domain": domain,
+        })
+        if len(results) >= max_results:
+            break
+    if not results:
+        # Mojeek served a page we couldn't parse — short breaker so we move on.
+        _MOJEEK_DISABLED_UNTIL = time.time() + 60
+    return results
+
+
+def _search_brave(query: str, max_results: int) -> List[Dict[str, str]]:
+    """Brave Search HTML scraper. Tends to work from datacenter IPs where
+    DuckDuckGo and Bing are blocked. No API key required."""
+    global _BRAVE_DISABLED_UNTIL, _BRAVE_LAST_CALL
+    # Serialize Brave calls and enforce min spacing to avoid 429s when
+    # multiple query variants are issued in parallel from the same process.
+    with _BRAVE_LOCK:
+        wait = _BRAVE_MIN_SPACING - (time.time() - _BRAVE_LAST_CALL)
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            resp = requests.get(
+                "https://search.brave.com/search",
+                params={"q": query, "source": "web"},
+                timeout=(3, 10),
+                headers={
+                    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                    "Accept-Language": "en-GB,en;q=0.9",
+                    "Accept": "text/html,application/xhtml+xml",
+                },
+            )
+            _BRAVE_LAST_CALL = time.time()
+            status = resp.status_code
+            if status == 429:
+                # Short breaker on rate limit so we recover quickly.
+                _BRAVE_DISABLED_UNTIL = time.time() + 60
+                logger.warning(f"Brave 429 for '{query[:60]}' (disabled 60s)")
+                return []
+            resp.raise_for_status()
+        except Exception as e:
+            _BRAVE_LAST_CALL = time.time()
+            _BRAVE_DISABLED_UNTIL = time.time() + 300
+            logger.warning(f"Brave search failed for '{query[:60]}': {e} (disabled 5m)")
+            return []
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    results: List[Dict[str, str]] = []
+    seen: set = set()
+    snippets = soup.select('div.snippet[data-type="web"]') or soup.select('div.snippet')
+    for snip in snippets:
+        a = snip.select_one('a[href^="http"]')
+        if not a:
+            continue
+        href = a.get("href", "")
+        if not href.startswith("http"):
+            continue
+        domain = normalize_domain(href)
+        if not domain or "brave.com" in domain or "search.brave" in domain:
+            continue
+        key = href.lower().strip()
+        if key in seen:
+            continue
+        seen.add(key)
+        title_el = snip.select_one('.title') or snip.find(['h2', 'h3'])
+        title = title_el.get_text(" ", strip=True) if title_el else a.get_text(" ", strip=True)
+        results.append({
+            "title": title,
+            "url": href,
+            "domain": domain,
+        })
+        if len(results) >= max_results:
+            break
+    if not results:
+        # Brave returned a page we can't parse (captcha/AB test) — trip the
+        # breaker briefly so we fall through faster on the next call.
+        _BRAVE_DISABLED_UNTIL = time.time() + 60
     return results
 
 
@@ -1190,7 +1607,9 @@ def _search_bing(query: str, max_results: int) -> List[Dict[str, str]]:
         )
         resp.raise_for_status()
     except Exception as e:
-        logger.warning(f"Bing search failed for '{query[:60]}': {e}")
+        global _BING_DISABLED_UNTIL
+        _BING_DISABLED_UNTIL = time.time() + 300
+        logger.warning(f"Bing search failed for '{query[:60]}': {e} (disabled 5m)")
         return []
 
     soup = BeautifulSoup(resp.text, "html.parser")
@@ -1256,7 +1675,9 @@ def _search_yahoo(query: str, max_results: int) -> List[Dict[str, str]]:
         )
         resp.raise_for_status()
     except Exception as e:
-        logger.warning(f"Yahoo search failed for '{query[:60]}': {e}")
+        global _YAHOO_DISABLED_UNTIL
+        _YAHOO_DISABLED_UNTIL = time.time() + 300
+        logger.warning(f"Yahoo search failed for '{query[:60]}': {e} (disabled 5m)")
         return []
 
     soup = BeautifulSoup(resp.text, "html.parser")
@@ -1640,9 +2061,11 @@ async def run_ai_address_verification(company_name: str, location: Optional[str]
     prompt = build_address_verification_prompt(company_name, location, country, evidence)
     loop = asyncio.get_event_loop()
     try:
+        _model = get_main_model()
+        _kw = chat_kwargs(_model)
         response = await loop.run_in_executor(
             None,
-            lambda: ollama.chat(model=AI_MODEL, messages=[{'role': 'user', 'content': prompt}], format='json')
+            lambda: ollama.chat(model=_model, messages=[{'role': 'user', 'content': prompt}], format='json', **_kw)
         )
         content = response['message']['content']
         parsed = json.loads(content)
@@ -2648,12 +3071,15 @@ async def run_ai_business_summary(record: Dict[str, Any]) -> Optional[str]:
     prompt = build_ai_business_summary_prompt(record)
     loop = asyncio.get_event_loop()
     try:
+        _model = get_summarizer_model()
+        _kw = chat_kwargs(_model)
         response = await loop.run_in_executor(
             None,
             lambda: ollama.chat(
-                model=AI_MODEL_SUMMARIZER,
+                model=_model,
                 messages=[{'role': 'user', 'content': prompt}],
                 format='json',
+                **_kw,
             ),
         )
         parsed = json.loads(response['message']['content'])
@@ -3772,6 +4198,26 @@ async def health_check():
     """Returns API status and active AI model name."""
     return {"status": "healthy", "model": AI_MODEL}
 
+@app.get("/models", tags=["System"])
+async def list_models():
+    """Lists models the API can switch to via the per-request `model` field."""
+    return {
+        "default": AI_MODEL,
+        "summarizer": AI_MODEL_SUMMARIZER,
+        "specialists": {
+            "matcher": AI_MODEL_MATCHER,
+            "validator": AI_MODEL_VALIDATOR,
+            "address": AI_MODEL_ADDRESS,
+            "classifier": AI_MODEL_CLASSIFIER,
+        },
+        "allowed_for_request_override": AI_MODEL_ALLOWED,
+        "thinking": {
+            "supported_prefixes": list(THINKING_MODEL_PREFIXES),
+            "default_for_thinking_models": False,
+            "per_request_field": "think",
+        },
+    }
+
 @app.get("/system-info", tags=["System"])
 async def system_info():
     """Returns active AI model, loaded Ollama models, and operational status."""
@@ -3797,12 +4243,23 @@ async def enrich_single(request: EnrichRequest):
     - Phones are verified via libphonenumber and cross-referenced across sources.
     - UK companies are automatically looked up on Companies House for directors, status, and registered address.
     """
+    try:
+        chosen = resolve_request_model(getattr(request, "model", None))
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    if chosen:
+        _REQUEST_MODEL.set(chosen)
+    _think = getattr(request, "think", None)
+    if _think is not None:
+        _REQUEST_THINK.set(bool(_think))
     if request.query:
         return await crawl_businesses(
             CrawlBusinessesRequest(
                 query=request.query,
                 location=request.location,
                 max_results=request.max_results,
+                model=request.model,
+                think=request.think,
             )
         )
 
@@ -3837,6 +4294,7 @@ async def enrich_single(request: EnrichRequest):
                     query=request.company_name,
                     location=discovery_location,
                     max_results=request.max_results,
+                    model=request.model,
                 )
             )
 
@@ -3873,7 +4331,7 @@ async def enrich_single(request: EnrichRequest):
         "resolved_url": target_url,
         "enrichment": ai_data,
         "confidence": confidence,
-        "processing_model": AI_MODEL
+        "processing_model": get_main_model()
     }
 
 @app.post("/batch-enrich", tags=["Enrichment"])
@@ -3982,6 +4440,13 @@ async def crawl_businesses(request: CrawlBusinessesRequest):
     3. Phones are verified via libphonenumber and cross-referenced (official site or 2+ sources required).
     4. Returns per-result enrichment, `domains_scanned` list, and a cross-referenced `overall_summary`.
     """
+    try:
+        chosen = resolve_request_model(getattr(request, "model", None))
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    token = _REQUEST_MODEL.set(chosen) if chosen else None
+    _think = getattr(request, "think", None)
+    think_token = _REQUEST_THINK.set(bool(_think)) if _think is not None else None
     try:
         candidates = await asyncio.get_event_loop().run_in_executor(
             None,
@@ -4163,14 +4628,16 @@ async def crawl_businesses(request: CrawlBusinessesRequest):
         "discovered": len(candidates),
         "domains_scanned": domains_scanned,
         "results": results,
-        "processing_model": AI_MODEL,
+        "processing_model": get_main_model(),
         "models": {
             "default": AI_MODEL,
+            "active": get_main_model(),
             "matcher": AI_MODEL_MATCHER,
             "validator": AI_MODEL_VALIDATOR,
             "address": AI_MODEL_ADDRESS,
             "classifier": AI_MODEL_CLASSIFIER,
-            "summarizer": AI_MODEL_SUMMARIZER,
+            "summarizer": get_summarizer_model(),
+            "allowed_for_request_override": AI_MODEL_ALLOWED,
         },
         "overall_summary": overall_summary,
         "verified_record": verified_record,
