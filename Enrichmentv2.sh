@@ -2189,15 +2189,43 @@ def company_name_tokens(company_name: str) -> List[str]:
 def normalize_company_name_for_match(value: str) -> str:
     """Normalize legal suffix variants for name matching only.
 
-    This is intentionally NOT used to rewrite output company names.
+    Strips two classes of noise so that a Companies House registered name
+    and the shorter trading name on a website / in the user's query compare
+    as the same core entity:
+
+      1. Legal-form suffixes anywhere in the string:
+         limited, ltd, ltd., plc, llp, llc, inc, incorporated, corp,
+         corporation, company, co.
+      2. Trailing structural / locale suffixes (only when they appear at
+         the END of the name, so genuine middle-of-name words like
+         "Brighton Care Group Plumbing" are preserved):
+         group, holdings, services, uk, (uk).
+
+    This is intentionally NOT used to rewrite output company names; it only
+    affects matching/scoring.
     """
     text = re.sub(r"[^A-Za-z0-9& ]+", " ", value or "")
+    # 1) Legal-form suffixes anywhere
     text = re.sub(
         r"\b(limited|ltd|plc|llp|llc|inc|incorporated|corp|corporation|company|co)\.?\b",
         " ",
         text,
         flags=re.IGNORECASE,
     )
+    # 2) Trailing structural / locale suffixes (repeat to peel multiples,
+    #    e.g. "ABC Holdings Group UK" -> "ABC")
+    for _ in range(4):
+        new_text = re.sub(
+            r"\b(group|holdings|holding|services|uk|gb|ni|england|scotland|wales)\s*$",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+        new_text = re.sub(r"\s+", " ", new_text).strip()
+        if new_text == text.strip():
+            text = new_text
+            break
+        text = new_text
     return re.sub(r"\s+", " ", text).strip().lower()
 
 
