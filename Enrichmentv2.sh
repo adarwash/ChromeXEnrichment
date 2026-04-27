@@ -50,22 +50,14 @@ if command -v nvidia-smi &> /dev/null; then
     TOTAL_VRAM_MB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | awk '{sum+=$1} END {print sum}')
     echo "[+] Found $GPU_COUNT GPU(s). Total VRAM: ${TOTAL_VRAM_MB}MB."
 
-    # Multi-GPU tuning for Ollama: spread scheduling and parallel workers.
-    # Scale parallel inference slots based on available VRAM.
-    if [ "$GPU_COUNT" -ge 2 ]; then
+    # Force use of all detected GPUs for inference/workload spread.
+    # Keep at least 1 worker/model slot even if detection returns empty.
+    if [ "$GPU_COUNT" -gt 0 ]; then
         OLLAMA_NUM_PARALLEL=$GPU_COUNT
-        OLLAMA_SCHED_SPREAD=1
         OLLAMA_MAX_LOADED_MODELS=$GPU_COUNT
-        MULTI_GPU_MODE="enabled (${GPU_COUNT} GPUs)"
-        echo "[+] Multi-GPU mode enabled. Ollama will spread workloads across ${GPU_COUNT} GPUs."
-    elif [ "$TOTAL_VRAM_MB" -gt 60000 ]; then
-        OLLAMA_NUM_PARALLEL=6
-        OLLAMA_MAX_LOADED_MODELS=3
-        echo "[+] Very-high-VRAM single GPU (>60GB). Setting OLLAMA_NUM_PARALLEL=6 + MAX_LOADED_MODELS=3 for max concurrent inference."
-    elif [ "$TOTAL_VRAM_MB" -gt 20000 ]; then
-        OLLAMA_NUM_PARALLEL=4
-        OLLAMA_MAX_LOADED_MODELS=2
-        echo "[+] High-VRAM single GPU. Setting OLLAMA_NUM_PARALLEL=4 + MAX_LOADED_MODELS=2 for faster concurrent inference."
+        OLLAMA_SCHED_SPREAD=1
+        MULTI_GPU_MODE="forced (${GPU_COUNT} GPUs)"
+        echo "[+] Forced GPU mode enabled. Ollama will use all detected GPUs (${GPU_COUNT})."
     fi
 else
     echo "[!] No NVIDIA drivers found. Mode: CPU Only."
@@ -176,6 +168,11 @@ export AI_MODEL_VALIDATOR=${AI_MODEL_VALIDATOR:-qwen3:32b}
 export AI_MODEL_VALIDATOR_STRONG=${AI_MODEL_VALIDATOR_STRONG:-qwen2.5:72b}
 export AI_MODEL_SUMMARIZER=${AI_MODEL_SUMMARIZER:-mistral-small:24b}
 export AI_MODEL_SUMMARIZER_STRONG=${AI_MODEL_SUMMARIZER_STRONG:-qwen3:32b}
+# Fast-mode lightweight model. Used when quality_mode="fast" so latency-sensitive
+# requests don't pay the qwen3:32b/mistral-small:24b cost. Defaults to llama3.1:8b.
+export AI_MODEL_MATCHER_FAST=${AI_MODEL_MATCHER_FAST:-llama3.1:8b}
+export AI_MODEL_SUMMARIZER_FAST=${AI_MODEL_SUMMARIZER_FAST:-llama3.1:8b}
+export AI_MODEL_VALIDATOR_FAST=${AI_MODEL_VALIDATOR_FAST:-llama3.1:8b}
 
 # Keep compatibility with existing installer variables used below.
 SELECTED_MODEL="$AI_MODEL_NAME"
@@ -189,7 +186,7 @@ if [ "$SPECIALIST_MODEL_DEFAULT" != "$SELECTED_MODEL" ]; then
 fi
 
 # Ensure all configured specialist strong models are present.
-for EXTRA_MODEL in "$AI_MODEL_MATCHER_STRONG" "$AI_MODEL_VALIDATOR_STRONG" "$AI_MODEL_SUMMARIZER" "$AI_MODEL_SUMMARIZER_STRONG"; do
+for EXTRA_MODEL in "$AI_MODEL_MATCHER_STRONG" "$AI_MODEL_VALIDATOR_STRONG" "$AI_MODEL_SUMMARIZER" "$AI_MODEL_SUMMARIZER_STRONG" "$AI_MODEL_MATCHER_FAST" "$AI_MODEL_SUMMARIZER_FAST" "$AI_MODEL_VALIDATOR_FAST"; do
     if [ -n "$EXTRA_MODEL" ]; then
         echo "[*] Pulling Configured Model: $EXTRA_MODEL"
         ollama pull "$EXTRA_MODEL" || echo "[!] Failed to pull $EXTRA_MODEL (continuing)"
@@ -268,6 +265,7 @@ import smtplib
 import contextvars
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import concurrent.futures as _cf
 from typing import Optional, List, Dict, Any, Literal
 from urllib.parse import urlparse, parse_qs, unquote, urljoin, quote_plus
 from pydantic import BaseModel, EmailStr, Field, model_validator
@@ -300,6 +298,11 @@ AI_MODEL_ADDRESS = os.getenv("AI_MODEL_ADDRESS", AI_MODEL)        # address comp
 AI_MODEL_CLASSIFIER = os.getenv("AI_MODEL_CLASSIFIER", AI_MODEL)  # industry / sector classification
 AI_MODEL_SUMMARIZER = os.getenv("AI_MODEL_SUMMARIZER", AI_MODEL)  # final business activity summary
 AI_MODEL_SUMMARIZER_STRONG = os.getenv("AI_MODEL_SUMMARIZER_STRONG", AI_MODEL_SUMMARIZER)  # quality-first narrative
+# Fast-mode lightweight overrides. Used when the request's quality_mode is "fast"
+# so we trade some accuracy for ~3-5x lower latency vs qwen3:32b.
+AI_MODEL_MATCHER_FAST = os.getenv("AI_MODEL_MATCHER_FAST", "llama3.1:8b")
+AI_MODEL_VALIDATOR_FAST = os.getenv("AI_MODEL_VALIDATOR_FAST", AI_MODEL_MATCHER_FAST)
+AI_MODEL_SUMMARIZER_FAST = os.getenv("AI_MODEL_SUMMARIZER_FAST", AI_MODEL_MATCHER_FAST)
 COMPANIES_HOUSE_API_KEY = os.getenv("COMPANIES_HOUSE_API_KEY", "").strip()
 
 def _env_int(name: str, default: int, min_value: int, max_value: int) -> int:
@@ -363,6 +366,8 @@ def get_matcher_model(quality_mode: Optional[str] = None) -> str:
     mode = (quality_mode or _REQUEST_QUALITY.get() or "balanced").strip().lower()
     if mode == "high":
         return AI_MODEL_MATCHER_STRONG or AI_MODEL_MATCHER
+    if mode == "fast":
+        return AI_MODEL_MATCHER_FAST or AI_MODEL_MATCHER
     return AI_MODEL_MATCHER
 
 def get_validator_model(quality_mode: Optional[str] = None, prefer_strong: bool = False) -> str:
@@ -377,6 +382,8 @@ def get_validator_model(quality_mode: Optional[str] = None, prefer_strong: bool 
     mode = (quality_mode or _REQUEST_QUALITY.get() or "balanced").strip().lower()
     if prefer_strong or mode == "high":
         return AI_MODEL_VALIDATOR_STRONG or AI_MODEL_VALIDATOR
+    if mode == "fast":
+        return AI_MODEL_VALIDATOR_FAST or AI_MODEL_VALIDATOR
     return AI_MODEL_VALIDATOR
 
 def get_address_model() -> str:
@@ -398,6 +405,8 @@ def get_summarizer_model(quality_mode: Optional[str] = None) -> str:
     mode = (quality_mode or _REQUEST_QUALITY.get() or "balanced").strip().lower()
     if mode == "high":
         return AI_MODEL_SUMMARIZER_STRONG or AI_MODEL_SUMMARIZER
+    if mode == "fast":
+        return AI_MODEL_SUMMARIZER_FAST or AI_MODEL_SUMMARIZER
     return AI_MODEL_SUMMARIZER
 
 def chat_kwargs(model: str) -> Dict[str, Any]:
@@ -411,9 +420,12 @@ def chat_kwargs(model: str) -> Dict[str, Any]:
     and summaries nondeterministic — picks flip between runs.
     """
     kwargs: Dict[str, Any] = {
-        # keep_alive=-1 ensures the model stays resident on GPU across calls,
-        # avoiding cold-load penalties (3-8s per swap on big models).
-        "keep_alive": -1,
+        # keep_alive=600 keeps the model resident on GPU for 10 minutes after
+        # the last call, avoiding cold-load penalties (3-8s per swap) while
+        # still allowing Ollama to evict idle models on single-GPU setups.
+        # -1 (infinite) risks OOM when multiple large models are loaded
+        # concurrently (e.g. qwen3:32b + qwen2.5:72b + mistral-small:24b).
+        "keep_alive": 600,
         "options": {
             "temperature": 0,
             "top_p": 1,
@@ -540,9 +552,11 @@ class CrawlRequest(BaseModel):
     url: str
 
 class CrawlBusinessesRequest(BaseModel):
-    query: str = Field(..., description="Business type or keyword, e.g. 'HVAC companies'")
+    query: Optional[str] = Field(default=None, description="Business type or keyword, e.g. 'HVAC companies'. Optional if 'company' is provided.")
+    company: Optional[str] = Field(default=None, description="Structured company name. When provided, used as the primary discovery query (no phone appended).")
+    phone: Optional[str] = Field(default=None, description="Structured phone number. When provided, runs a phone-first reverse-lookup SERP pass and short-circuits matching for any candidate page that contains the phone.")
     location: Optional[str] = Field(default=None, description="Optional city/region/country")
-    max_results: int = Field(default=10, ge=1, le=50)
+    max_results: int = Field(default=6, ge=1, le=50)
     model: Optional[str] = Field(
         default=None,
         description="Optional per-request override of the main reasoner model (must be in /models allow-list).",
@@ -555,6 +569,31 @@ class CrawlBusinessesRequest(BaseModel):
         default="balanced",
         description="Quality preset for discovery/validation. 'high' enables stronger AI reranking when available.",
     )
+    verifier_timeout_s: Optional[int] = Field(
+        default=None,
+        ge=15,
+        le=600,
+        description="Optional timeout override (seconds) for verified-record LLM build. Defaults: fast=45, balanced=90, high=150.",
+    )
+    require_verified_record: bool = Field(
+        default=False,
+        description="When true, /enrich-verified returns 404 instead of degraded fallback if verifier times out/fails.",
+    )
+
+    @model_validator(mode="after")
+    def _synthesize_query(self):
+        # Backward compat: allow {company, phone} input style. We deliberately
+        # do NOT append phone to query — phone-bearing search strings get
+        # routed to reverse-phone-lookup junk by general SERPs. Phone is used
+        # as a separate first-pass SERP variant + page-level matcher instead.
+        if not (self.query or "").strip():
+            if (self.company or "").strip():
+                self.query = self.company.strip()
+            elif (self.phone or "").strip():
+                self.query = self.phone.strip()
+            else:
+                raise ValueError("Provide at least one of: query, company, phone")
+        return self
 
 class SystemStatus(BaseModel):
     status: str
@@ -591,12 +630,15 @@ def fetch_html_from_url(url: str, allow_non_html: bool = False) -> Optional[str]
 # that inject contact details via JavaScript.
 _CRAWL4AI_AVAILABLE = True
 _CRAWL4AI_DISABLED_UNTIL = 0.0
+_CRAWL4AI_CONSECUTIVE_FAILURES = 0
+_CRAWL4AI_FAILURE_THRESHOLD = 5  # trip breaker only after this many in a row
 
 def fetch_html_with_crawl4ai(url: str, timeout_s: int = 25) -> Optional[str]:
     """Render `url` in headless Chromium via Crawl4AI and return the rendered
-    HTML. Returns None on any failure. Process-level circuit breaker trips on
-    repeated failures to avoid hanging the worker."""
-    global _CRAWL4AI_AVAILABLE, _CRAWL4AI_DISABLED_UNTIL
+    HTML. Returns None on any failure. Process-level circuit breaker trips
+    only after several consecutive failures so that one slow/antibot site
+    doesn't disable JS rendering for every subsequent URL."""
+    global _CRAWL4AI_AVAILABLE, _CRAWL4AI_DISABLED_UNTIL, _CRAWL4AI_CONSECUTIVE_FAILURES
     if not _CRAWL4AI_AVAILABLE:
         return None
     if time.time() < _CRAWL4AI_DISABLED_UNTIL:
@@ -614,19 +656,95 @@ def fetch_html_with_crawl4ai(url: str, timeout_s: int = 25) -> Optional[str]:
         async with AsyncWebCrawler(config=browser_cfg) as crawler:
             result = await crawler.arun(url=url, config=run_cfg)
             if result and getattr(result, "success", False):
-                return getattr(result, "html", None) or getattr(result, "cleaned_html", None)
+                # Crawl4AI 0.8.x: result.html is a non-optional str (may be
+                # empty ""), fit_html and cleaned_html are Optional[str].
+                # Try all HTML variants so trafilatura and BeautifulSoup callers
+                # always receive proper HTML when available.
+                html_out = (
+                    getattr(result, "html", None) or
+                    getattr(result, "fit_html", None) or
+                    getattr(result, "cleaned_html", None)
+                )
+                if html_out:
+                    return html_out
+                # Final fallback: Crawl4AI's own extracted text (markdown).
+                # Callers must detect this is not HTML before running trafilatura.
+                return (
+                    getattr(result, "fit_markdown", None) or
+                    getattr(result, "markdown", None)
+                )
             return None
 
+    def _run_in_fresh_loop() -> Optional[str]:
+        # Always run the Crawl4AI coroutine on a brand-new event loop in
+        # whichever thread we're currently on. This is safe because we only
+        # reach this helper when there is no loop already running on this
+        # thread.
+        # set_event_loop is required so that any internal asyncio.get_event_loop()
+        # calls inside Crawl4AI / Playwright resolve correctly on Python 3.12+
+        # where a RuntimeError is raised if no current loop is set on the thread.
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            return loop.run_until_complete(asyncio.wait_for(_run(), timeout=timeout_s + 5))
+        finally:
+            try:
+                asyncio.set_event_loop(None)
+                loop.close()
+            except Exception:
+                pass
+
     try:
-        return asyncio.run(asyncio.wait_for(_run(), timeout=timeout_s + 5))
-    except RuntimeError:
-        # Already inside a running event loop (shouldn't happen from our
-        # executor threads, but guard anyway).
-        return None
+        # If we're being called from within an already-running event loop
+        # (e.g. from an async route handler that didn't dispatch us through
+        # an executor), `asyncio.run` raises immediately. Detect that and
+        # dispatch to a worker thread that owns its own fresh loop.
+        try:
+            asyncio.get_running_loop()
+            in_async_ctx = True
+        except RuntimeError:
+            in_async_ctx = False
+
+        if in_async_ctx:
+            with ThreadPoolExecutor(max_workers=1) as ex:
+                future = ex.submit(_run_in_fresh_loop)
+                html = future.result(timeout=timeout_s + 10)
+        else:
+            html = _run_in_fresh_loop()
+        # Success path: reset the consecutive-failure counter.
+        _CRAWL4AI_CONSECUTIVE_FAILURES = 0
+        return html
+    except _cf.TimeoutError:
+        _CRAWL4AI_CONSECUTIVE_FAILURES += 1
+        logger.info(f"Crawl4AI thread-dispatch timeout for {url}")
+    except RuntimeError as e:
+        # crawl4ai's own "Failed on navigating ACS-GOTO" wrapper around a
+        # per-page Playwright timeout — expected for slow/antibot sites,
+        # count it but don't log at warning level.
+        msg = str(e)
+        if "ACS-GOTO" in msg or "Timeout" in msg:
+            _CRAWL4AI_CONSECUTIVE_FAILURES += 1
+            logger.info(f"Crawl4AI navigation timeout for {url}")
+        else:
+            # Unexpected runtime error — log but don't penalise the breaker
+            # so a code-path bug can't disable JS rendering globally.
+            logger.warning(f"Crawl4AI runtime error for {url}: {e}")
+            return None
+    except asyncio.TimeoutError:
+        _CRAWL4AI_CONSECUTIVE_FAILURES += 1
+        logger.info(f"Crawl4AI overall timeout for {url}")
     except Exception as e:
+        _CRAWL4AI_CONSECUTIVE_FAILURES += 1
         logger.warning(f"Crawl4AI fetch failed for {url}: {e}")
+
+    if _CRAWL4AI_CONSECUTIVE_FAILURES >= _CRAWL4AI_FAILURE_THRESHOLD:
+        logger.warning(
+            f"Crawl4AI hit {_CRAWL4AI_CONSECUTIVE_FAILURES} consecutive "
+            f"failures; pausing fallback for 120s"
+        )
         _CRAWL4AI_DISABLED_UNTIL = time.time() + 120
-        return None
+        _CRAWL4AI_CONSECUTIVE_FAILURES = 0
+    return None
 
 
 def html_to_text(html: str) -> str:
@@ -810,12 +928,7 @@ def format_registered_office_address(address_data: Any) -> Optional[str]:
 
 def build_overall_b2b_summary(query: str, location: Optional[str], results: List[Dict[str, Any]], domains_scanned: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     def names_look_related(a: str, b: str) -> bool:
-        a_tokens = set(company_name_tokens(a or ""))
-        b_tokens = set(company_name_tokens(b or ""))
-        if not a_tokens or not b_tokens:
-            return slugify_text(a or "") == slugify_text(b or "")
-        overlap = len(a_tokens.intersection(b_tokens))
-        return overlap >= min(2, len(a_tokens), len(b_tokens))
+        return company_names_equivalent(a or "", b or "")
 
     def choose_best_text(values: List[str]) -> Optional[str]:
         ranked: Dict[str, Dict[str, Any]] = {}
@@ -946,7 +1059,7 @@ def build_overall_b2b_summary(query: str, location: Optional[str], results: List
         if title_name:
             all_name_candidates.append(title_name)
 
-    company_name = choose_best_text(all_name_candidates)
+    company_name = requested_company_name(query) or choose_best_text(all_name_candidates)
 
     # Trust only Companies House records that match the target company name/query.
     trusted_companies_house_hits = []
@@ -957,6 +1070,13 @@ def build_overall_b2b_summary(query: str, location: Optional[str], results: List
             trusted_companies_house_hits.append(item)
 
     primary = trusted_companies_house_hits[0] if trusted_companies_house_hits else (companies_house_hits[0] if companies_house_hits else successful_sorted[0])
+
+    # Preserve the requested company name; only fall back to CH if query-derived
+    # name is empty.
+    if not company_name and trusted_companies_house_hits:
+        trusted_name = str(((trusted_companies_house_hits[0].get("companies_house") or {}).get("matched_company_name") or "")).strip()
+        if trusted_name:
+            company_name = trusted_name
 
     companies_house_url = None
     if isinstance(primary.get("companies_house"), dict):
@@ -1272,6 +1392,18 @@ def normalize_directors(ai_data: Dict[str, Any], text_content: str) -> Dict[str,
     return ai_data
 
 
+# Single-GPU Ollama: serialize concurrent ai-extraction calls so they
+# queue cleanly instead of stepping on each other (Ollama itself queues
+# but GPU memory pressure can stall a parallel burst). Cap at 1 to keep
+# tail-latency predictable on heavy LLMs like qwen3:32b.
+_AI_EXTRACTION_SEM = asyncio.Semaphore(1)
+
+# Hard ceiling for any single ollama.chat() call. Without this a single stuck
+# inference can hold the semaphore forever and cause the whole pipeline to
+# silently hang for the request budget. 120s is generous enough for qwen3:32b
+# on a single GPU but bounded enough to surface real problems quickly.
+_OLLAMA_CALL_TIMEOUT_S = 120
+
 async def run_ai_extraction(text_content: str,
                             hints: Optional[Dict[str, str]] = None,
                             quality_mode: Optional[str] = None):
@@ -1287,15 +1419,22 @@ async def run_ai_extraction(text_content: str,
         # Run synchronous ollama call in a thread executor
         _model = get_matcher_model(quality_mode)
         _kw = chat_kwargs(_model)
-        response = await loop.run_in_executor(
-            None,
-            lambda: ollama.chat(model=_model, messages=[{'role': 'user', 'content': prompt}], format='json', **_kw)
-        )
+        async with _AI_EXTRACTION_SEM:
+            response = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    lambda: ollama.chat(model=_model, messages=[{'role': 'user', 'content': prompt}], format='json', **_kw)
+                ),
+                timeout=_OLLAMA_CALL_TIMEOUT_S,
+            )
         content = response['message']['content']
         parsed = json.loads(content)
         if not isinstance(parsed, dict):
             return None
         return normalize_directors(parsed, text_content)
+    except asyncio.TimeoutError:
+        logger.warning(f"AI extraction timed out after {_OLLAMA_CALL_TIMEOUT_S}s (model={get_matcher_model(quality_mode)})")
+        return None
     except Exception as e:
         logger.error(f"AI Extraction Error: {e}")
         return None
@@ -1342,16 +1481,26 @@ def clean_text_from_url(url: str):
     # If the static fetch produced nothing useful (no email and no phone-shaped
     # digit run), retry with Crawl4AI's headless-browser renderer. This catches
     # JS-injected contact details that `requests`+`trafilatura` can't see.
-    if not _text_has_contact_signals(text):
+    # SKIP in fast mode: Crawl4AI launches a headless browser per page and adds
+    # 5-15s of latency. Fast mode trades JS-rendered sites for speed.
+    _fast_mode = (_REQUEST_QUALITY.get() or "").strip().lower() == "fast"
+    if not _fast_mode and not _text_has_contact_signals(text):
         rendered = fetch_html_with_crawl4ai(url)
         if rendered:
-            try:
-                extracted = trafilatura.extract(rendered, include_comments=False)
-                if extracted and _text_has_contact_signals(extracted):
-                    return extracted
-            except Exception:
-                pass
-            rendered_text = html_to_text(rendered)
+            # Crawl4AI 0.8.x may return markdown/text when no raw HTML is
+            # available. Detect by checking for an HTML opening tag; trafilatura
+            # needs proper HTML input — calling it on plain text returns None.
+            if rendered.lstrip().startswith("<"):
+                try:
+                    extracted = trafilatura.extract(rendered, include_comments=False)
+                    if extracted and _text_has_contact_signals(extracted):
+                        return extracted
+                except Exception:
+                    pass
+                rendered_text = html_to_text(rendered)
+            else:
+                # Already extracted text (markdown fallback from Crawl4AI).
+                rendered_text = rendered
             if _text_has_contact_signals(rendered_text):
                 return rendered_text
     return text
@@ -1383,7 +1532,8 @@ def parse_ddg_result_url(href: str) -> str:
 def discover_business_urls(query: str,
                            location: Optional[str],
                            max_results: int,
-                           quality_mode: str = "balanced") -> List[Dict[str, str]]:
+                           quality_mode: str = "balanced",
+                           phone: Optional[str] = None) -> List[Dict[str, str]]:
     search_query = query.strip()
     if location:
         search_query = f"{search_query} {location.strip()}"
@@ -1392,12 +1542,13 @@ def discover_business_urls(query: str,
     if mode not in QUALITY_MODES:
         mode = "balanced"
 
-    # Quality budget: high explores deeper candidate pools and more SERP
-    # variants; fast keeps a narrower budget for lower latency.
-    per_query_multiplier = 2 if mode == "fast" else 3 if mode == "balanced" else 5
+    # Quality budget: high still explores deeper than balanced, but keep the
+    # SERP fan-out bounded so one request doesn't run far past the latency
+    # target under rate-limited search backends.
+    per_query_multiplier = 2 if mode == "fast" else 3
     target_count = max_results
     if mode == "high":
-        target_count = min(50, max(max_results + 4, int(max_results * 1.8)))
+        target_count = min(18, max(max_results + 2, int(max_results * 1.25)))
 
     blocked_domains = {
         "bing.com", "www.bing.com", "duckduckgo.com", "www.duckduckgo.com",
@@ -1429,6 +1580,25 @@ def discover_business_urls(query: str,
         seen_query_variants.add(key)
         query_variants.append(v)
 
+    # Phone-first variant: when an explicit phone is supplied, search for the
+    # quoted phone number directly. Reverse-phone-lookup search returns the
+    # owning business's site with very high precision, often as the #1 hit,
+    # which lets us short-circuit most of the candidate enrichment chain.
+    phone_e164: Optional[str] = None
+    phone_digits: Optional[str] = None
+    if phone and phone.strip():
+        verified = verify_phone_offline(phone.strip(), location)
+        if verified:
+            phone_e164 = verified.get("e164")
+            phone_intl = verified.get("international")
+            if phone_e164:
+                phone_digits = re.sub(r"\D", "", phone_e164)
+                _add_variant(f'"{phone_e164}"')
+            if phone_intl and phone_intl != phone_e164:
+                _add_variant(f'"{phone_intl}"')
+        else:
+            _add_variant(f'"{phone.strip()}"')
+
     if cleaned and cleaned.lower() != search_query.lower():
         _add_variant(cleaned)
     else:
@@ -1450,12 +1620,9 @@ def discover_business_urls(query: str,
 
         if mode == "high":
             official = f'"{name_for_quote}" official website'
-            contact = f'"{name_for_quote}" contact'
             if location:
                 official = f"{official} {location.strip()}"
-                contact = f"{contact} {location.strip()}"
             _add_variant(official)
-            _add_variant(contact)
 
     # Fast mode uses only the strongest first variant to minimize latency.
     if mode == "fast" and len(query_variants) > 1:
@@ -1571,7 +1738,11 @@ def _search_with_crawl4ai(query: str, max_results: int) -> List[Dict[str, str]]:
     seen_urls: set = set()
     any_engine_returned = False
     for engine, url in targets:
-        html = fetch_html_with_crawl4ai(url, timeout_s=20)
+        # Use requests-based fetch for search engine pages: Crawl4AI 0.8.x may
+        # return markdown (not HTML) which breaks BeautifulSoup link extraction.
+        # DDG's html/ endpoint and Bing both serve static HTML to curl-like
+        # agents; headless rendering adds latency without benefit here.
+        html = fetch_html_from_url(url)
         if not html:
             continue
         soup = BeautifulSoup(html, "html.parser")
@@ -1983,11 +2154,133 @@ def has_postcode_pattern(text: str) -> bool:
 
 
 def company_name_tokens(company_name: str) -> List[str]:
+    stop_tokens = {
+        "inc", "llc", "ltd", "the", "and", "group", "company", "co",
+        "filling", "station", "stations", "service", "services",
+        "garage", "garages", "fuel", "petrol", "holdings", "uk",
+    }
     tokens = []
     for token in re.findall(r"[A-Za-z0-9]+", company_name.lower()):
-        if len(token) > 2 and token not in {"inc", "llc", "ltd", "the", "and", "group", "company", "co"}:
+        if len(token) > 2 and token not in stop_tokens:
             tokens.append(token)
     return list(dict.fromkeys(tokens))
+
+
+def normalize_company_name_for_match(value: str) -> str:
+    """Normalize legal suffix variants for name matching only.
+
+    This is intentionally NOT used to rewrite output company names.
+    """
+    text = re.sub(r"[^A-Za-z0-9& ]+", " ", value or "")
+    text = re.sub(
+        r"\b(limited|ltd|plc|llp|llc|inc|incorporated|corp|corporation|company|co)\.?\b",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def company_names_equivalent(a: str, b: str) -> bool:
+    if not a or not b:
+        return False
+    if slugify_text(a) == slugify_text(b):
+        return True
+
+    norm_a = normalize_company_name_for_match(a)
+    norm_b = normalize_company_name_for_match(b)
+    if norm_a and norm_b and slugify_text(norm_a) == slugify_text(norm_b):
+        return True
+
+    a_tokens = set(company_name_tokens(a))
+    b_tokens = set(company_name_tokens(b))
+    if not a_tokens or not b_tokens:
+        return False
+    overlap = len(a_tokens.intersection(b_tokens))
+    min_size = min(len(a_tokens), len(b_tokens))
+    return overlap >= 2 and (overlap / max(1, min_size)) >= 0.75
+
+
+def company_name_match_score(a: str, b: str) -> int:
+    """Return a conservative 0-100 score for company-name relatedness."""
+    if not a or not b:
+        return 0
+    if company_names_equivalent(a, b):
+        return 100
+
+    a_tokens = set(company_name_tokens(a))
+    b_tokens = set(company_name_tokens(b))
+    if not a_tokens or not b_tokens:
+        return 0
+
+    overlap = len(a_tokens.intersection(b_tokens))
+    if overlap == 0:
+        return 0
+
+    recall = overlap / max(1, len(b_tokens))
+    precision = overlap / max(1, len(a_tokens))
+    # Bias slightly toward recall vs the requested/query name.
+    score = int(round((0.65 * recall + 0.35 * precision) * 100))
+    return max(0, min(100, score))
+
+
+def requested_company_name(query: str) -> str:
+    """Preserve the user-requested company name, stripping phone noise only."""
+    text = strip_phones_from_text(query or "")
+    text = re.sub(r"\s+", " ", text).strip(" ,;|-")
+    return text.strip()
+
+
+def expanded_company_name_tokens(company_name: str) -> List[str]:
+    """Return legal-name tokens plus common brand aliases used in domains.
+
+    Example: "veterinary" often appears as "vet" / "vets" in website hosts.
+    """
+    base = company_name_tokens(company_name)
+    out: List[str] = list(base)
+    alias_map = {
+        "veterinary": ["vet", "vets"],
+        "veterinarian": ["vet", "vets"],
+        "clinic": ["clinic", "clinics"],
+        "surgery": ["surgery", "surgeries"],
+    }
+    seen = set(out)
+    for token in base:
+        for alias in alias_map.get(token, []):
+            if alias not in seen:
+                out.append(alias)
+                seen.add(alias)
+    return out
+
+
+def get_industry_specific_crawl_paths(company_name: str, query: Optional[str] = None) -> List[str]:
+    """Return industry-specific URL paths to crawl before website validation scoring.
+
+    Examples: veterinary practices should crawl /our-practices, /services;
+    law firms should crawl /team, /attorneys, etc. This helps boost accuracy
+    for multi-location or multi-practice businesses.
+    """
+    full_text = f"{company_name} {query or ''}".lower()
+    base_paths = ["/contact", "/contact-us", "/about", "/about-us"]
+
+    # Veterinary/animal health
+    if any(w in full_text for w in ["veterinary", "vet", "animal", "surgery", "clinic"]):
+        base_paths.extend(["/our-practices", "/practices", "/services", "/clinics",
+                          "/locations", "/offices", "/team", "/vets"])
+
+    # Law firms
+    if "law" in full_text or "solicitor" in full_text or "attorney" in full_text:
+        base_paths.extend(["/team", "/attorneys", "/solicitors", "/services",
+                          "/practices", "/offices"])
+
+    # Medical/dental
+    if any(w in full_text for w in ["dental", "dentist", "medical", "surgery",
+                                      "clinic", "health", "doctor"]):
+        base_paths.extend(["/doctors", "/dentists", "/team", "/services",
+                          "/locations", "/practices", "/clinics"])
+
+    # Remove duplicates while preserving order
+    return list(dict.fromkeys(base_paths))
 
 
 def likely_company_match(company_name: str, title: str, url: str) -> bool:
@@ -2889,15 +3182,29 @@ def website_company_match_score(ch_record: Optional[Dict[str, Any]],
     ch = ch_record or {}
     ch_name = str(ch.get("matched_company_name") or "").strip()
     name_tokens = company_name_tokens(ch_name) if ch_name else []
+    expanded_name_tokens = expanded_company_name_tokens(ch_name) if ch_name else []
     primary_token = name_tokens[0] if name_tokens else ""
 
     # 1) Domain ↔ company name overlap
     domain_token_hits = [t for t in name_tokens if t and t in domain_slug]
+    alias_token_hits = [t for t in expanded_name_tokens if t and t not in name_tokens and t in domain_slug]
     if domain_token_hits:
         score += 30
         matches.append(f"domain_contains_name_token({','.join(domain_token_hits)})")
         signals["domain_token_hits"] = domain_token_hits
+        if alias_token_hits:
+            score += min(12, 6 * len(alias_token_hits))
+            matches.append(f"domain_contains_alias_token({','.join(alias_token_hits)})")
+            signals["domain_alias_token_hits"] = alias_token_hits
+    elif alias_token_hits:
+        score += min(18, 9 * len(alias_token_hits))
+        matches.append(f"domain_contains_alias_token({','.join(alias_token_hits)})")
+        signals["domain_alias_token_hits"] = alias_token_hits
     elif primary_token:
+        # Directory/registry pages can score highly on copied address/company
+        # metadata. If the host itself has no company-name alignment, apply a
+        # small penalty so brand domains win when other evidence is similar.
+        score -= 12
         mismatches.append("domain_missing_company_name")
 
     # 2) Page mentions company name
@@ -2907,6 +3214,9 @@ def website_company_match_score(ch_record: Optional[Dict[str, Any]],
     elif name_tokens and sum(1 for t in name_tokens if t in text_lower) >= max(1, len(name_tokens) // 2):
         score += 8
         matches.append("page_mentions_name_tokens")
+    elif expanded_name_tokens and sum(1 for t in expanded_name_tokens if t in text_lower) >= max(1, len(expanded_name_tokens) // 3):
+        score += 6
+        matches.append("page_mentions_name_aliases")
 
     # 3) Address signals
     ch_addr = format_registered_office_address(ch.get("registered_office_address"))
@@ -2919,8 +3229,13 @@ def website_company_match_score(ch_record: Optional[Dict[str, Any]],
         page_postcodes = set()
         for m in re.finditer(r"[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}", website_text, flags=re.IGNORECASE):
             page_postcodes.add(normalized_postcode(m.group(0)))
-        for m in re.finditer(r"\b\d{5}(?:-\d{4})?\b", website_text):
-            page_postcodes.add(normalized_postcode(m.group(0)))
+        country = (country_hint or "").strip().upper()
+        is_uk = country in {"UK", "GB", "UNITED KINGDOM", "ENGLAND", "SCOTLAND", "WALES", "NORTHERN IRELAND"}
+        # Only consider US ZIP patterns when we're not clearly in a UK flow.
+        # Otherwise UK phone area codes (e.g. 01723) can be misread as ZIPs.
+        if not is_uk:
+            for m in re.finditer(r"\b\d{5}(?:-\d{4})?\b", website_text):
+                page_postcodes.add(normalized_postcode(m.group(0)))
         signals["page_postcodes"] = sorted(page_postcodes)[:8]
 
         if registered_office_is_proxy:
@@ -2989,7 +3304,7 @@ def website_company_match_score(ch_record: Optional[Dict[str, Any]],
         signals["ai_industry"] = industry
 
     return {
-        "score": min(100, score),
+        "score": max(0, min(100, score)),
         "matches": matches,
         "mismatches": mismatches,
         "signals": signals,
@@ -3008,9 +3323,14 @@ JUNK_WEBSITE_DOMAINS = {
     "mirror.co.uk", "thesun.co.uk", "dailymail.co.uk",
     "bbc.co.uk", "bbc.com", "wikipedia.org",
     "endole.co.uk", "checkcompany.co.uk", "companycheck.co.uk",
+    "companieslist.co.uk", "companiesintheuk.co.uk", "companieshub.co.uk", "efinder.uk", "opengovuk.com",
     "opencorporates.com", "duedil.com", "dnb.com",
+    "ukdata.com", "192.com", "1stdirectory.co.uk", "bizseek.co.uk", "cylex-uk.co.uk", "brownbook.net",
+    "hotfrog.co.uk", "scoot.co.uk", "thomsonlocal.com",
     "find-and-update.company-information.service.gov.uk",
     "yell.com", "thomsonlocal.com", "yelp.com", "yelp.co.uk",
+    "zoominfo.com", "crunchbase.com", "glassdoor.com", "glassdoor.co.uk",
+    "indeed.co.uk", "search.yahoo.com", "yahoo.com", "duckduckgo.com",
     "linkedin.com", "facebook.com", "twitter.com", "instagram.com",
     "tiktok.com", "youtube.com", "google.com", "g.page", "maps.apple.com",
 }
@@ -3018,7 +3338,7 @@ JUNK_WEBSITE_DOMAINS = {
 # A website candidate must beat this validator score (0-100) before we will
 # treat it as the company's likely official site. Anything weaker is reported
 # as "no validated website" rather than crowning a junk domain.
-WEBSITE_MIN_MATCH_SCORE = 30
+WEBSITE_MIN_MATCH_SCORE = 70
 
 
 # Companies that provide registered-office / virtual-office / formations
@@ -3335,30 +3655,35 @@ def find_official_website(ch_record: Dict[str, Any],
 
     candidates: List[Dict[str, Any]] = []
     digit_variants = _phone_digit_variants(query_phones) if query_phones else []
+    crawl_paths = get_industry_specific_crawl_paths(legal_name, query="")
     for domain, hit in seen.items():
         url = hit.get("url") or f"https://{domain}"
         text = clean_text_from_url(url) or ""
         # If a query phone was supplied but doesn't appear on the SERP
-        # landing page, also peek at /contact, /about, etc. — companies
-        # frequently list their phone there and not on a deep landing page.
-        # This mirrors find_website_by_phone so the +35 query_phone_on_page
-        # signal can actually fire in the legal-name discovery pass too.
+        # landing page, also peek at /contact, /about, /services, /practices, etc.
+        # Industry-specific paths (e.g. /our-practices for veterinary) improve
+        # multi-location business detection. Companies frequently list their phone
+        # there and not on a deep landing page.
+        found_phone = False
         if digit_variants:
             page_digits = re.sub(r"\D", "", text)
-            if not any(v and v in page_digits for v in digit_variants):
-                for path in ("/contact", "/contact-us", "/about", "/about-us"):
-                    try:
-                        extra_url = f"https://{domain}{path}"
-                        extra_html = fetch_html_from_url(extra_url) or ""
-                        if not extra_html:
-                            continue
-                        extra_text = html_to_text(extra_html)
-                        if extra_text:
-                            text = (text + "\n" + extra_text)[:80000]
-                            if any(v and v in re.sub(r"\D", "", extra_text) for v in digit_variants):
-                                break
-                    except Exception:
+            found_phone = any(v and v in page_digits for v in digit_variants)
+        if not found_phone or len(text) < 5000:
+            for path in crawl_paths:
+                try:
+                    extra_url = f"https://{domain}{path}"
+                    extra_html = fetch_html_from_url(extra_url) or ""
+                    if not extra_html:
                         continue
+                    extra_text = html_to_text(extra_html)
+                    if extra_text:
+                        text = (text + "\n" + extra_text)[:80000]
+                        if digit_variants and not found_phone:
+                            if any(v and v in re.sub(r"\D", "", extra_text) for v in digit_variants):
+                                found_phone = True
+                                break
+                except Exception:
+                    continue
         match = website_company_match_score(
             ch_record, text, domain, None, None, country_hint,
             query_phones=query_phones,
@@ -3723,7 +4048,7 @@ def build_ai_business_summary_prompt(record: Dict[str, Any]) -> str:
     facts = []
     for key in ["matched_company", "company_number", "company_status",
                 "registered_address", "verified_address", "likely_website",
-                "industry", "phones", "emails", "directors"]:
+                "industry", "nature_of_business_sic", "phones", "emails", "directors"]:
         item = record.get(key)
         if not item:
             continue
@@ -4038,6 +4363,7 @@ async def build_verified_b2b_record(query: str,
         "matched_company": None,
         "company_number": None,
         "company_status": None,
+        "nature_of_business_sic": None,
         "registered_address": None,
         "registered_address_fields": None,
         "verified_address": None,
@@ -4071,20 +4397,31 @@ async def build_verified_b2b_record(query: str,
         and (item["companies_house"].get("company_number") or item["companies_house"].get("matched_company_name"))
     ]
     ch_primary = None
+    ch_sic_fallback: Optional[Dict[str, Any]] = None
+    ch_sic_fallback_score = -1
+    summary_name = str(overall_summary.get("company_name") or "")
+    best_ch = None
+    best_ch_score = -1
     for item in companies_house_hits:
         ch = item["companies_house"]
         matched = str(ch.get("matched_company_name") or "")
         if not matched:
             continue
-        # Reuse the same trust check as overall_summary: name overlap with query/summary.
-        summary_name = str(overall_summary.get("company_name") or "")
-        toks_a = set(company_name_tokens(matched))
-        toks_b = set(company_name_tokens(summary_name)) | set(company_name_tokens(query or ""))
-        if toks_a and toks_b and toks_a.intersection(toks_b):
-            ch_primary = ch
-            break
-    if not ch_primary and companies_house_hits:
-        ch_primary = companies_house_hits[0]["companies_house"]
+        score = max(
+            company_name_match_score(matched, summary_name),
+            company_name_match_score(matched, query or ""),
+        )
+        alt_sic = [str(code).strip() for code in (ch.get("sic_codes") or []) if str(code).strip()]
+        if alt_sic and score >= 35 and score > ch_sic_fallback_score:
+            ch_sic_fallback = ch
+            ch_sic_fallback_score = score
+        if score > best_ch_score:
+            best_ch_score = score
+            best_ch = ch
+    if best_ch is not None and best_ch_score >= 50:
+        ch_primary = best_ch
+    elif companies_house_hits:
+        logger.info(f"Skipping weak Companies House candidate for query '{query}' (score={best_ch_score})")
     if not ch_primary:
         # When web discovery is noisy/empty, still try a direct CH lookup using
         # a cleaned query string (remove phones and location noise).
@@ -4097,20 +4434,39 @@ async def build_verified_b2b_record(query: str,
                     None, companies_house_lookup_by_name, query_for_ch,
                 )
                 if isinstance(direct_ch, dict) and (direct_ch.get("matched_company_name") or direct_ch.get("company_number")):
-                    ch_primary = direct_ch
+                    direct_name = str(direct_ch.get("matched_company_name") or "")
+                    direct_score = max(
+                        company_name_match_score(direct_name, summary_name),
+                        company_name_match_score(direct_name, query or ""),
+                    )
+                    if direct_score >= 50:
+                        ch_primary = direct_ch
+                    else:
+                        direct_sic = [str(code).strip() for code in (direct_ch.get("sic_codes") or []) if str(code).strip()]
+                        if direct_sic and direct_score >= 35 and direct_score > ch_sic_fallback_score:
+                            ch_sic_fallback = direct_ch
+                            ch_sic_fallback_score = direct_score
+                        logger.info(
+                            f"Rejecting weak direct Companies House fallback for '{query}' (score={direct_score})"
+                        )
             except Exception as e:
                 logger.warning(f"Direct Companies House fallback failed: {e}")
 
     # ---- 2) Authoritative identity fields from Companies House ----
+    requested_name = requested_company_name(query)
     if ch_primary:
         legal_name = ch_primary.get("matched_company_name")
         company_number = ch_primary.get("company_number")
         company_status = ch_primary.get("company_status")
-        if legal_name:
+        display_name = requested_name or legal_name
+        if display_name:
+            name_notes = ["preserved from user query"] if requested_name else []
+            if legal_name and requested_name and slugify_text(legal_name) != slugify_text(requested_name):
+                name_notes.append(f"Companies House legal name: {legal_name}")
             set_field("matched_company", field_record(
-                legal_name, "companies_house",
+                display_name, "companies_house",
                 SOURCE_CONFIDENCE["companies_house"],
-                notes=["from Companies House register"]))
+                notes=name_notes or ["from Companies House register"]))
         if company_number:
             set_field("company_number", field_record(
                 company_number, "companies_house",
@@ -4119,6 +4475,23 @@ async def build_verified_b2b_record(query: str,
             set_field("company_status", field_record(
                 company_status, "companies_house",
                 SOURCE_CONFIDENCE["companies_house"]))
+
+        sic_codes = [str(code).strip() for code in (ch_primary.get("sic_codes") or []) if str(code).strip()]
+        if sic_codes:
+            set_field("nature_of_business_sic", field_record(
+                sic_codes, "companies_house",
+                SOURCE_CONFIDENCE["companies_house"],
+                notes=["Nature of business (SIC) from Companies House"]))
+
+    if not record.get("nature_of_business_sic") and ch_sic_fallback:
+        fallback_sic = [str(code).strip() for code in (ch_sic_fallback.get("sic_codes") or []) if str(code).strip()]
+        if fallback_sic:
+            set_field("nature_of_business_sic", field_record(
+                fallback_sic,
+                "companies_house",
+                85,
+                notes=[f"Nature of business (SIC) from Companies House candidate (name score {ch_sic_fallback_score})"],
+            ))
 
         ch_addr = format_registered_office_address(ch_primary.get("registered_office_address"))
         if ch_addr:
@@ -4217,9 +4590,15 @@ async def build_verified_b2b_record(query: str,
     pooled: Dict[str, Dict[str, Any]] = {}
     for src_choice in (website_choice, fresh_choice, phone_choice):
         for cand in (src_choice.get("candidates") or []):
-            dom = (cand.get("domain") or "").lower()
+            dom = normalize_domain_hint(cand.get("domain") or "")
             if not dom:
                 continue
+            # Defensive gate: never allow directory/junk/formations hosts to
+            # survive into final ranking, even if an upstream pass leaked one.
+            if is_junk_website_domain(dom) or is_formations_agent_domain(dom):
+                continue
+            cand = dict(cand)
+            cand["domain"] = dom
             existing = pooled.get(dom)
             if existing is None or int(cand.get("match_score") or 0) > int(existing.get("match_score") or 0):
                 pooled[dom] = cand
@@ -4641,13 +5020,12 @@ async def build_verified_b2b_record(query: str,
             if cand:
                 ai_name = cand
                 break
-        if ai_name and slugify_text(ai_name) != slugify_text(legal):
+        if ai_name and not company_names_equivalent(ai_name, legal):
             # Genuinely different from the legal name → likely a trading name.
-            if not any(suffix in ai_name.lower() for suffix in ["limited", "ltd", "plc", "llp"]):
-                set_field("trading_name", field_record(
-                    ai_name, "ai_inferred",
-                    SOURCE_CONFIDENCE["ai_inferred"],
-                    notes=[f"differs from registered legal name; from {site_domain}"]))
+            set_field("trading_name", field_record(
+                ai_name, "ai_inferred",
+                SOURCE_CONFIDENCE["ai_inferred"],
+                notes=[f"differs from registered legal name; from {site_domain}"]))
 
     # ---- 9) Social links ----
     social_links: Dict[str, str] = {}
@@ -4816,16 +5194,69 @@ def companies_house_lookup_by_name(company_name: str) -> Optional[Dict[str, Any]
 
         return {"appointed_on": appointed, "date_of_birth_month_year": dob}
 
-    search_results = discover_companies_house_api(company_name, 1)
+    def extract_sic_codes(raw_value: Any) -> List[str]:
+        """Return full SIC entries e.g. ['93120 - Activities of sport clubs'].
+        Falls back to bare code numbers when no description is available."""
+        codes: List[str] = []
+        seen: set = set()
+
+        values: List[str] = []
+        if isinstance(raw_value, list):
+            values = [str(v or "").strip() for v in raw_value if str(v or "").strip()]
+        elif isinstance(raw_value, str):
+            values = [raw_value]
+
+        for value in values:
+            # Full entry already has description: "93120 - Activities of sport clubs"
+            m = re.match(r'^(\d{4,5})\s*[-\u2013]\s*(.+)', value.strip())
+            if m and m.group(2).strip():
+                code = m.group(1)
+                entry = f"{code} - {m.group(2).strip()}"
+                if code not in seen:
+                    seen.add(code)
+                    codes.append(entry)
+                continue
+            # Otherwise scan for bare numeric codes
+            for match in re.findall(r'\b\d{4,5}\b', value):
+                if match not in seen:
+                    seen.add(match)
+                    codes.append(match)
+        return codes
+
+    cleaned_company_name = strip_phones_from_text(company_name or "")
+    cleaned_company_name = re.sub(
+        r"\b(united kingdom|uk|england|scotland|wales|northern ireland)\b",
+        " ",
+        cleaned_company_name,
+        flags=re.IGNORECASE,
+    )
+    cleaned_company_name = re.sub(r"\s+", " ", cleaned_company_name).strip()
+    name_for_match = cleaned_company_name or company_name
+
+    search_results = discover_companies_house_api(name_for_match, 8)
     source = "companies_house_api"
     if not search_results:
-        search_results = discover_companies_house_web(company_name, 1)
+        search_results = discover_companies_house_web(name_for_match, 8)
         source = "companies_house_web"
 
     if not search_results:
         return None
 
-    base = search_results[0]
+    best_result = None
+    best_score = -1
+    for result in search_results:
+        title = str(result.get("title") or "")
+        score = company_name_match_score(title, name_for_match)
+        if score > best_score:
+            best_score = score
+            best_result = result
+
+    # Guardrail: do not trust weak CH hits for noisy/ambiguous queries.
+    if best_result is None or best_score < 50:
+        logger.info(f"Rejecting weak Companies House match for '{company_name}' (score={best_score})")
+        return None
+
+    base = best_result
     company_number = base.get("company_number")
     profile_url = base.get("url")
 
@@ -4835,6 +5266,7 @@ def companies_house_lookup_by_name(company_name: str) -> Optional[Dict[str, Any]
             "matched_company_name": base.get("title"),
             "company_number": None,
             "company_status": None,
+            "sic_codes": [],
             "directors": [],
             "registered_office_address": None,
             "incorporation_date": None,
@@ -4880,11 +5312,13 @@ def companies_house_lookup_by_name(company_name: str) -> Optional[Dict[str, Any]
                     })
 
             address = p_json.get("registered_office_address") if isinstance(p_json, dict) else None
+            sic_codes = extract_sic_codes((p_json or {}).get("sic_codes"))
             return {
                 "source": source,
                 "matched_company_name": p_json.get("company_name") or base.get("title"),
                 "company_number": company_number,
                 "company_status": p_json.get("company_status"),
+                "sic_codes": sic_codes,
                 "directors": [d for d in director_rows if d.get("name")],
                 "registered_office_address": address,
                 "incorporation_date": p_json.get("date_of_creation"),
@@ -4902,6 +5336,7 @@ def companies_house_lookup_by_name(company_name: str) -> Optional[Dict[str, Any]
         status = None
         inc_date = None
         registered_office_address = None
+        sic_codes: List[str] = []
         for dt in soup.select("dt"):
             key = dt.get_text(" ", strip=True).lower()
             dd = dt.find_next_sibling("dd")
@@ -4912,6 +5347,44 @@ def companies_house_lookup_by_name(company_name: str) -> Optional[Dict[str, Any]
                 inc_date = value
             if key == "registered office address":
                 registered_office_address = value
+            if "nature of business" in key:
+                # Prefer individual <li> items so each "code - description"
+                # entry is captured cleanly without concatenation artefacts.
+                li_items = [li.get_text(" ", strip=True) for li in dd.select("li")] if dd else []
+                if li_items:
+                    sic_codes = extract_sic_codes(li_items)
+                elif value:
+                    sic_codes = extract_sic_codes(value)
+
+        # Companies House often renders SIC inside a dedicated section headed
+        # "Nature of business (SIC)" rather than dt/dd pairs.
+        if not sic_codes:
+            for heading in soup.find_all(["h2", "h3"]):
+                heading_text = heading.get_text(" ", strip=True).lower()
+                if "nature of business" not in heading_text and "sic" not in heading_text:
+                    continue
+
+                section = heading.find_parent("section") or heading.parent
+                if not section:
+                    continue
+
+                li_items = [li.get_text(" ", strip=True) for li in section.select("li")]
+                if li_items:
+                    sic_codes = extract_sic_codes(li_items)
+                else:
+                    sic_codes = extract_sic_codes(section.get_text(" ", strip=True))
+
+                if sic_codes:
+                    break
+
+        # CSS fallback for alternative page templates.
+        if not sic_codes:
+            css_li_items = [
+                li.get_text(" ", strip=True)
+                for li in soup.select("[id*='sic'] li, [class*='sic'] li")
+            ]
+            if css_li_items:
+                sic_codes = extract_sic_codes(css_li_items)
 
         if not registered_office_address:
             office_node = soup.select_one("#company-registered-office-address, .registered-office-address, [data-id='company-registered-office-address']")
@@ -5010,6 +5483,7 @@ def companies_house_lookup_by_name(company_name: str) -> Optional[Dict[str, Any]
             "matched_company_name": base.get("title"),
             "company_number": company_number,
             "company_status": status,
+            "sic_codes": sic_codes,
             "directors": director_rows,
             "registered_office_address": registered_office_address,
             "incorporation_date": inc_date,
@@ -5022,6 +5496,7 @@ def companies_house_lookup_by_name(company_name: str) -> Optional[Dict[str, Any]
             "matched_company_name": base.get("title"),
             "company_number": company_number,
             "company_status": None,
+            "sic_codes": [],
             "directors": [],
             "registered_office_address": None,
             "incorporation_date": None,
@@ -5181,10 +5656,26 @@ async def enrich_single(request: EnrichRequest):
         else:
             confidence = score_enrichment(ai_data, hints, text_content)
 
+        # Normalise contact details through the same pipeline as /crawl-businesses:
+        # regex extraction → libphonenumber validation → E.164 / international format.
+        # Raw ai_data phones are LLM-extracted strings that may not be normalised.
+        contact_details = extract_contact_details(
+            text_content, country_hint=request.location or request.country
+        )
+        # Merge the caller-supplied phone hint if it validates.
+        _hint_phone = (request.phone_number or "").strip()
+        if _hint_phone:
+            _vp = verify_phone_offline(_hint_phone, request.location or request.country)
+            if _vp and (_vp.get("is_valid") or _vp.get("is_possible")):
+                _norm = _vp["international"]
+                if _norm not in contact_details["phones"]:
+                    contact_details["phones"].insert(0, _norm)
+
         return {
             "domain": request.domain,
             "resolved_url": target_url,
             "enrichment": ai_data,
+            "contact_details": contact_details,
             "confidence": confidence,
             "processing_model": get_main_model(),
             "quality_mode": get_quality_mode(),
@@ -5315,8 +5806,11 @@ async def crawl_businesses(request: CrawlBusinessesRequest):
 
     discovery_cap = request.max_results
     if quality == "high":
-        # In high mode, crawl a deeper candidate set to improve recall.
-        discovery_cap = min(50, max(request.max_results + 4, int(request.max_results * 1.8)))
+        # In high mode, crawl deeper than balanced but keep latency bounded.
+        # Cap aggressively — single-GPU LLM calls dominate, so each extra
+        # candidate adds ~5–15s. Phone-match short-circuit handles deeper
+        # recall without paying full enrichment cost on every candidate.
+        discovery_cap = min(8, max(request.max_results + 1, int(request.max_results * 1.25)))
     elif quality == "fast":
         discovery_cap = max(1, min(request.max_results, 8))
 
@@ -5328,6 +5822,7 @@ async def crawl_businesses(request: CrawlBusinessesRequest):
             request.location,
             discovery_cap,
             quality,
+            getattr(request, "phone", None),
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Discovery failed: {e}")
@@ -5338,10 +5833,18 @@ async def crawl_businesses(request: CrawlBusinessesRequest):
     shared_companies_house: Optional[Dict[str, Any]] = None
     if is_uk_location(request.location):
         try:
+            # Strip phone numbers and location noise before passing to CH search;
+            # the raw query (e.g. "Acme Ltd +44 1782 624316") confuses the search.
+            ch_query = strip_phones_from_text(request.query or "")
+            ch_query = re.sub(
+                r"\b(united kingdom|uk|england|scotland|wales|northern ireland)\b",
+                " ", ch_query, flags=re.IGNORECASE,
+            )
+            ch_query = re.sub(r"\s+", " ", ch_query).strip()
             shared_companies_house = await asyncio.get_event_loop().run_in_executor(
                 None,
                 companies_house_lookup_by_name,
-                request.query,
+                ch_query,
             )
         except Exception as e:
             logger.warning(f"Shared Companies House lookup failed: {e}")
@@ -5349,9 +5852,9 @@ async def crawl_businesses(request: CrawlBusinessesRequest):
     aggregator_domains = {
         "efinder.uk", "opengovuk.com", "checkcompany.co.uk",
         "find-and-update.company-information.service.gov.uk",
-        "endole.co.uk", "companieslist.co.uk", "companycheck.co.uk",
+        "endole.co.uk", "companieslist.co.uk", "companieshub.co.uk", "companycheck.co.uk",
         "dnb.com", "duedil.com", "opencorporates.com",
-        "companiesintheuk.co.uk", "ukdata.com", "192.com",
+        "companiesintheuk.co.uk", "1stdirectory.co.uk", "bizseek.co.uk", "ukdata.com", "192.com",
         "cylex-uk.co.uk", "brownbook.net", "hotfrog.co.uk",
         "scoot.co.uk", "thomsonlocal.com", "yell.com",
         "yelp.com", "yelp.co.uk", "trustpilot.com",
@@ -5362,7 +5865,53 @@ async def crawl_businesses(request: CrawlBusinessesRequest):
         "bing.com", "duckduckgo.com", "search.yahoo.com", "yahoo.com",
     }
 
-    async def enrich_candidate(item: Dict[str, str]):
+    candidate_timeout_s = 150 if quality == "high" else (120 if quality == "balanced" else 45)
+    request_timeout_s = 400 if quality == "high" else (300 if quality == "balanced" else 75)
+
+    # Pre-normalize the user-supplied phone so we can do cheap deterministic
+    # page-level match checks (digits-only). When a candidate page contains
+    # the phone we treat it as a hard match: bypass the aggregator filter,
+    # force AI extraction, and boost confidence — this skips the LLM
+    # matcher/picker passes that dominate latency on single-GPU setups.
+    request_phone_e164: Optional[str] = None
+    request_phone_digits: Optional[str] = None
+    _req_phone_raw = (getattr(request, "phone", None) or "").strip()
+    if _req_phone_raw:
+        _verified = verify_phone_offline(_req_phone_raw, request.location)
+        if _verified and _verified.get("e164"):
+            request_phone_e164 = _verified["e164"]
+            request_phone_digits = re.sub(r"\D", "", request_phone_e164)
+        else:
+            request_phone_digits = re.sub(r"\D", "", _req_phone_raw)
+
+    def _page_contains_phone(text: str) -> bool:
+        if not text or not request_phone_digits or len(request_phone_digits) < 7:
+            return False
+        page_digits = re.sub(r"\D", "", text)
+        # Match on the trailing 9–11 digits to tolerate country-code formatting
+        # variation (e.g. "0" vs "+44").
+        tail = request_phone_digits[-9:]
+        return tail in page_digits
+
+    def _budget_timeout_result(item: Dict[str, str], reason: str = "request_timeout") -> Dict[str, Any]:
+        return {
+            "title": item.get("title"),
+            "url": item.get("url"),
+            "domain": item.get("domain"),
+            "source": item.get("source", "web"),
+            "status": "timeout",
+            "enrichment": None,
+            "companies_house": shared_companies_house,
+            "contact_details": {"emails": [], "phones": []},
+            "confidence": {
+                "overall": 0,
+                "band": "low",
+                "reasons": [reason],
+                "signals": {"email_count": 0, "phone_count": 0},
+            },
+        }
+
+    async def _enrich_candidate(item: Dict[str, str]):
         text = await asyncio.get_event_loop().run_in_executor(None, clean_text_from_url, item["url"])
         if not text:
             return {
@@ -5376,8 +5925,44 @@ async def crawl_businesses(request: CrawlBusinessesRequest):
             "discovery_query": request.query,
             "location": request.location or "",
         }
+        if request_phone_e164:
+            hints["phone"] = request_phone_e164
         candidate_domain = item.get("domain", "")
         is_aggregator = any(candidate_domain == agg or candidate_domain.endswith("." + agg) for agg in aggregator_domains)
+
+        # Phone-lookup directories (tellows, phonelookup, slick.ly, etc.) and
+        # formations agents republish business phone numbers verbatim. A page
+        # phone-match on these is NOT a real identity signal and would falsely
+        # promote the candidate to high confidence. Detect them up-front so
+        # the short-circuit below skips them.
+        domain_is_junk = False
+        try:
+            for _bad in JUNK_WEBSITE_DOMAINS:
+                if candidate_domain == _bad or candidate_domain.endswith("." + _bad):
+                    domain_is_junk = True
+                    break
+            if not domain_is_junk:
+                for _bad in FORMATIONS_AGENT_DOMAINS:
+                    if candidate_domain == _bad or candidate_domain.endswith("." + _bad):
+                        domain_is_junk = True
+                        break
+        except NameError:
+            # Blocklists not defined in this build; fall back to aggregator-only check.
+            domain_is_junk = False
+
+        # Phone short-circuit: a deterministic page-level phone match is much
+        # stronger than any LLM signal. When present we force AI extraction
+        # (even on aggregator-classified hosts, since the phone proves the
+        # business identity) and tag the result for confidence boosting.
+        # EXCEPTION: never short-circuit on known phone-directory / formations
+        # agent domains — they republish numbers and would produce false
+        # "verified" records.
+        phone_match_raw = _page_contains_phone(text)
+        phone_match = bool(phone_match_raw) and not domain_is_junk
+        if phone_match_raw and domain_is_junk:
+            logger.info(f"Phone match suppressed on junk/aggregator domain: {candidate_domain}")
+        if phone_match:
+            is_aggregator = False
 
         # Skip heavy AI extraction for known aggregator/directory/search pages.
         # These rarely represent the target business and mostly add latency.
@@ -5400,12 +5985,24 @@ async def crawl_businesses(request: CrawlBusinessesRequest):
 
         contact_details = extract_contact_details(text, country_hint=request.location) if not is_aggregator else {"emails": [], "phones": []}
 
+        if phone_match and isinstance(confidence, dict):
+            # Hard, deterministic identity match — promote to a high-confidence
+            # band and record the reason so downstream picker/summary logic
+            # can prefer this candidate without another LLM rerank.
+            confidence["overall"] = max(int(confidence.get("overall") or 0), 92)
+            confidence["band"] = "high"
+            reasons = list(confidence.get("reasons") or [])
+            if "user_phone_match" not in reasons:
+                reasons.append("user_phone_match")
+            confidence["reasons"] = reasons
+
         return {
             "title": item["title"],
             "url": item["url"],
             "domain": item["domain"],
             "source": item.get("source", "web"),
             "is_aggregator": is_aggregator,
+            "phone_match": phone_match,
             "status": "success" if ai_data else "ai_failed",
             "enrichment": ai_data,
             "companies_house": companies_house,
@@ -5413,8 +6010,108 @@ async def crawl_businesses(request: CrawlBusinessesRequest):
             "confidence": confidence,
         }
 
-    tasks = [enrich_candidate(item) for item in candidates]
-    results = await asyncio.gather(*tasks)
+    async def enrich_candidate(item: Dict[str, str]):
+        try:
+            return await asyncio.wait_for(_enrich_candidate(item), timeout=candidate_timeout_s)
+        except asyncio.TimeoutError:
+            logger.warning(f"Candidate enrichment timed out after {candidate_timeout_s}s: {item.get('url')}")
+            return {
+                "title": item.get("title"),
+                "url": item.get("url"),
+                "domain": item.get("domain"),
+                "source": item.get("source", "web"),
+                "status": "timeout",
+                "enrichment": None,
+                "companies_house": shared_companies_house,
+                "contact_details": {"emails": [], "phones": []},
+                "confidence": {
+                    "overall": 0,
+                    "band": "low",
+                    "reasons": ["candidate_timeout"],
+                    "signals": {"email_count": 0, "phone_count": 0},
+                },
+            }
+        except Exception as e:
+            logger.warning(f"Candidate enrichment failed for {item.get('url')}: {e}")
+            return {
+                "title": item.get("title"),
+                "url": item.get("url"),
+                "domain": item.get("domain"),
+                "source": item.get("source", "web"),
+                "status": "error",
+                "enrichment": None,
+                "companies_house": shared_companies_house,
+                "contact_details": {"emails": [], "phones": []},
+                "confidence": {
+                    "overall": 0,
+                    "band": "low",
+                    "reasons": ["candidate_error"],
+                    "signals": {"email_count": 0, "phone_count": 0},
+                },
+            }
+
+    task_map: Dict[asyncio.Task, Dict[str, str]] = {
+        asyncio.create_task(enrich_candidate(item)): item
+        for item in candidates
+    }
+    results: List[Dict[str, Any]] = []
+    completed_tasks: set = set()
+    early_exit_on_phone = bool(request_phone_digits)
+
+    async def _drain_with_early_exit() -> None:
+        """Consume tasks as they complete. If a phone-matched success arrives
+        we cancel the rest and short-circuit — the matched candidate already
+        contains full enrichment (address, phones, emails) so further
+        candidates would only add noise + latency."""
+        for fut in asyncio.as_completed(list(task_map.keys())):
+            try:
+                res = await fut
+            except Exception as e:
+                # find which task this was so we can record the right url
+                for t, it in task_map.items():
+                    if t.done() and t not in completed_tasks:
+                        completed_tasks.add(t)
+                        results.append(_budget_timeout_result(it, reason=f"task_error:{type(e).__name__}"))
+                        break
+                continue
+            results.append(res)
+            # Mark the originating task as accounted for.
+            for t, it in task_map.items():
+                if t.done() and t not in completed_tasks and it.get("url") == res.get("url"):
+                    completed_tasks.add(t)
+                    break
+            if early_exit_on_phone and res.get("phone_match") and res.get("status") == "success":
+                logger.info(
+                    f"Phone-match short-circuit: {res.get('domain')} matched "
+                    f"user phone; cancelling {len(task_map) - len(completed_tasks)} pending candidates"
+                )
+                for t in task_map:
+                    if not t.done():
+                        t.cancel()
+                # Drain cancelled tasks quietly.
+                await asyncio.gather(*task_map.keys(), return_exceptions=True)
+                return
+
+    try:
+        await asyncio.wait_for(_drain_with_early_exit(), timeout=request_timeout_s)
+    except asyncio.TimeoutError:
+        logger.warning(
+            f"crawl-businesses timed out after {request_timeout_s}s; returning partial results"
+        )
+        for task in task_map:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*task_map.keys(), return_exceptions=True)
+        for task, item in task_map.items():
+            if task in completed_tasks:
+                continue
+            if task.cancelled() or not task.done():
+                results.append(_budget_timeout_result(item, reason="request_budget_timeout"))
+                continue
+            try:
+                results.append(task.result())
+            except Exception:
+                results.append(_budget_timeout_result(item, reason="request_task_error"))
     domains_scanned = [
         {"domain": r.get("domain"), "url": r.get("url"), "title": r.get("title"), "status": r.get("status")}
         for r in results
@@ -5428,14 +6125,43 @@ async def crawl_businesses(request: CrawlBusinessesRequest):
         if item.get("status") == "success" and not item.get("is_aggregator"):
             summary_domain = item.get("domain")
             break
+
+    # Skip the secondary address-verify re-crawl whenever the cross-referenced
+    # `overall_summary` already carries an address, OR a phone-matched
+    # candidate has one. The verify pass triggers another headless crawl +
+    # LLM extraction (~30-90s on single-GPU qwen3:32b) and rarely improves
+    # results when an address is already present. Always skipping when
+    # populated keeps the wall-clock under the 5-minute budget.
+    skip_addr_verify = False
+    if (overall_summary.get("address") or "").strip():
+        skip_addr_verify = True
+    elif request_phone_digits:
+        for r in results:
+            if r.get("phone_match") and (r.get("enrichment") or {}).get("address"):
+                skip_addr_verify = True
+                break
+
     try:
-        addr_result = await evaluate_business_address_request(
-            VerifyBusinessAddressRequest(
-                company_name=summary_company,
-                domain=summary_domain,
-                location=request.location,
-            )
-        )
+        if skip_addr_verify:
+            addr_result = None
+        else:
+            # Hard wall-clock cap: never let the secondary verify exceed 30s,
+            # even if Ollama or Crawl4AI hangs. Returning None falls through
+            # to the existing branch that keeps the original summary address.
+            try:
+                addr_result = await asyncio.wait_for(
+                    evaluate_business_address_request(
+                        VerifyBusinessAddressRequest(
+                            company_name=summary_company,
+                            domain=summary_domain,
+                            location=request.location,
+                        )
+                    ),
+                    timeout=30,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("address-verify timed out after 30s; using primary summary address")
+                addr_result = None
         if addr_result and addr_result.get("verified"):
             candidate_verified_addr = addr_result.get("best_address") or ""
             candidate_verified_fields = dict(addr_result.get("best_address_fields") or {})
@@ -5491,15 +6217,37 @@ async def crawl_businesses(request: CrawlBusinessesRequest):
         logger.warning(f"Address verification in enrichment failed: {e}")
 
     # ---- Build the explainable, CRM-ready verified B2B record ----
-    try:
-        verified_record = await build_verified_b2b_record(
-            request.query, request.location, results, overall_summary,
-            quality_mode=quality,
-        )
-        overall_summary["verified_record"] = verified_record
-    except Exception as e:
-        logger.warning(f"Verified record build failed: {e}")
-        verified_record = None
+    # Hard wall-clock cap: this call fans out additional LLM passes
+    # (matcher, validator, summarizer) and is a frequent source of tail
+    # latency on single-GPU setups. 60s is enough for a clean run but
+    # forces graceful degradation when Ollama is contended/stuck.
+    # Per-mode timeout defaults: fast=45s, balanced=90s, high=150s.
+    # Request-level override is supported via verifier_timeout_s.
+    _vr_timeout_default = {"fast": 45, "balanced": 150, "high": 200}.get(quality, 150)
+    _vr_timeout = int(request.verifier_timeout_s or _vr_timeout_default)
+    # Fast mode: skip the verifier+summarizer entirely. They fan out 3-5 extra
+    # LLM passes (matcher rerun, validator rerank, summarizer narrative) which
+    # dominate latency. Caller still gets the full overall_summary + per-result
+    # enrichment; only the explainable verified_record is omitted.
+    verified_record = None
+    if quality == "fast":
+        logger.info("fast mode: skipping verified-record build (use balanced/high for verified_record)")
+    else:
+        try:
+            verified_record = await asyncio.wait_for(
+                build_verified_b2b_record(
+                    request.query, request.location, results, overall_summary,
+                    quality_mode=quality,
+                ),
+                timeout=_vr_timeout,
+            )
+            overall_summary["verified_record"] = verified_record
+        except asyncio.TimeoutError:
+            logger.warning(f"verified-record build timed out after {_vr_timeout}s; returning without it")
+            verified_record = None
+        except Exception as e:
+            logger.warning(f"Verified record build failed: {e}")
+            verified_record = None
 
     return {
         "query": request.query,
@@ -5527,6 +6275,7 @@ async def crawl_businesses(request: CrawlBusinessesRequest):
         "quality_mode": quality,
         "overall_summary": overall_summary,
         "verified_record": verified_record,
+        "companies_house": shared_companies_house,
     }
 
 
@@ -5554,14 +6303,102 @@ async def enrich_verified_endpoint(request: CrawlBusinessesRequest):
     if not isinstance(full, dict):
         raise HTTPException(status_code=500, detail="Enrichment pipeline returned unexpected payload")
     record = full.get("verified_record")
+    degraded = False
     if not record:
-        raise HTTPException(status_code=404, detail="No verified record could be produced for this query")
+        if request.require_verified_record:
+            raise HTTPException(
+                status_code=404,
+                detail="No verified record could be produced for this query (verifier timed out or failed). Try increasing verifier_timeout_s or set require_verified_record=false.",
+            )
+        # Graceful fallback: synthesise a minimal verified_record from
+        # overall_summary so the caller always gets something usable
+        # (Companies House / website discovery may have succeeded even
+        # when the LLM verifier timed out or was contended).
+        summary = full.get("overall_summary") or {}
+        results_list = full.get("results") or []
+        websites = []
+        emails = []
+        phones = []
+        for r in results_list:
+            if not isinstance(r, dict):
+                continue
+            url = r.get("url") or r.get("domain")
+            if url and url not in websites:
+                websites.append(url)
+            contact = r.get("contact_details") or {}
+            for e in (contact.get("emails") or []):
+                if e and e not in emails:
+                    emails.append(e)
+            for p in (contact.get("phones") or []):
+                if p and p not in phones:
+                    phones.append(p)
+        # Prefer already cross-referenced summary fields when available.
+        for e in (summary.get("emails") or []):
+            if e and e not in emails:
+                emails.append(e)
+        for p in (summary.get("phones") or []):
+            if p and p not in phones:
+                phones.append(p)
+        # Prefer phone the user supplied as the canonical phone
+        req_phone = (getattr(request, "phone", None) or "").strip()
+        if req_phone and req_phone not in phones:
+            phones.insert(0, req_phone)
+        # Use Companies House data as the authoritative source when available
+        # (this survives even when all web candidates time out).
+        ch = full.get("companies_house") or {}
+        ch_number = ch.get("company_number") or summary.get("company_number")
+        ch_status = ch.get("company_status") or summary.get("company_status")
+        ch_address = None
+        raw_addr = ch.get("registered_office_address")
+        if isinstance(raw_addr, dict):
+            ch_address = ", ".join(
+                v for v in [
+                    raw_addr.get("address_line_1"),
+                    raw_addr.get("address_line_2"),
+                    raw_addr.get("locality"),
+                    raw_addr.get("region"),
+                    raw_addr.get("postal_code"),
+                    raw_addr.get("country"),
+                ] if v
+            ) or None
+        elif isinstance(raw_addr, str):
+            ch_address = raw_addr or None
+        ch_address = ch_address or summary.get("address")
+        ch_directors = ch.get("directors") or summary.get("directors") or []
+        ch_name = ch.get("matched_company_name") or summary.get("company_name") or request.query
+        record = {
+            "matched_company": ch_name,
+            "company_number": ch_number,
+            "company_status": ch_status,
+            "registered_address": ch_address,
+            "verified_address": summary.get("verified_address") or ch_address,
+            "verified_address_fields": summary.get("verified_address_fields"),
+            "directors": ch_directors,
+            "likely_website": summary.get("website") or (websites[0] if websites else None),
+            "websites": websites,
+            "phones": phones,
+            "emails": emails,
+            "industry": summary.get("industry"),
+            "social_links": summary.get("social_links") or {},
+            "trading_name": summary.get("trading_name"),
+            "field_confidence": {},
+            "field_sources": {},
+            "validation_notes": [
+                "Degraded record: LLM verifier was unavailable or timed out; fields composed directly from primary discovery summary."
+            ],
+            "mismatch_warnings": [],
+            "final_enrichment_summary": summary.get("summary") or summary.get("description") or "",
+        }
+        degraded = True
     return {
         "query": request.query,
         "location": request.location,
         "models": full.get("models"),
         "quality_mode": full.get("quality_mode"),
         "domains_scanned": full.get("domains_scanned"),
+        "degraded": degraded,
+        "require_verified_record": request.require_verified_record,
+        "verifier_timeout_s": request.verifier_timeout_s,
         "verified_record": record,
     }
 
@@ -5599,10 +6436,18 @@ Environment="AI_MODEL_ADDRESS=${AI_MODEL_ADDRESS:-$SPECIALIST_MODEL_DEFAULT}"
 Environment="AI_MODEL_CLASSIFIER=${AI_MODEL_CLASSIFIER:-$SPECIALIST_MODEL_DEFAULT}"
 Environment="AI_MODEL_SUMMARIZER=${AI_MODEL_SUMMARIZER:-mistral-small:24b}"
 Environment="AI_MODEL_SUMMARIZER_STRONG=${AI_MODEL_SUMMARIZER_STRONG:-qwen3:32b}"
+Environment="AI_MODEL_MATCHER_FAST=${AI_MODEL_MATCHER_FAST:-llama3.1:8b}"
+Environment="AI_MODEL_VALIDATOR_FAST=${AI_MODEL_VALIDATOR_FAST:-llama3.1:8b}"
+Environment="AI_MODEL_SUMMARIZER_FAST=${AI_MODEL_SUMMARIZER_FAST:-llama3.1:8b}"
 Environment="COMPANIES_HOUSE_API_KEY=${COMPANIES_HOUSE_API_KEY:-}"
 Environment="OLLAMA_NUM_PARALLEL=$OLLAMA_NUM_PARALLEL"
 Environment="OLLAMA_KEEP_ALIVE=-1"
-ExecStart=$VENV_DIR/bin/uvicorn main:app --host 0.0.0.0 --port $APP_PORT --workers $OLLAMA_NUM_PARALLEL
+# IMPORTANT: --workers MUST stay at 1. The app's _AI_EXTRACTION_SEM = Semaphore(1)
+# only serializes within a single Python process. With multiple workers, each
+# worker gets its own semaphore and concurrent qwen3:32b calls collide on the
+# single GPU (CUDA OOM, nondeterministic latency, silent hangs). Concurrency for
+# I/O-bound work is provided by asyncio inside this single process.
+ExecStart=$VENV_DIR/bin/uvicorn main:app --host 0.0.0.0 --port $APP_PORT --workers 1
 Restart=always
 RestartSec=10
 
@@ -5639,12 +6484,16 @@ else
     export AI_MODEL_CLASSIFIER=${AI_MODEL_CLASSIFIER:-$SPECIALIST_MODEL_DEFAULT}
     export AI_MODEL_SUMMARIZER=${AI_MODEL_SUMMARIZER:-mistral-small:24b}
     export AI_MODEL_SUMMARIZER_STRONG=${AI_MODEL_SUMMARIZER_STRONG:-qwen3:32b}
+    export AI_MODEL_MATCHER_FAST=${AI_MODEL_MATCHER_FAST:-llama3.1:8b}
+    export AI_MODEL_VALIDATOR_FAST=${AI_MODEL_VALIDATOR_FAST:-llama3.1:8b}
+    export AI_MODEL_SUMMARIZER_FAST=${AI_MODEL_SUMMARIZER_FAST:-llama3.1:8b}
     export AI_MODEL_ALLOWED=${AI_MODEL_ALLOWED:-qwen3:32b,qwen2.5:72b,mistral-small:24b,qwen2.5:32b,llama3.1:8b}
     export COMPANIES_HOUSE_API_KEY=${COMPANIES_HOUSE_API_KEY:-}
     export OLLAMA_NUM_PARALLEL=$OLLAMA_NUM_PARALLEL
     export OLLAMA_SCHED_SPREAD=$OLLAMA_SCHED_SPREAD
     export OLLAMA_MAX_LOADED_MODELS=$OLLAMA_MAX_LOADED_MODELS
-    nohup $VENV_DIR/bin/uvicorn main:app --host 0.0.0.0 --port $APP_PORT --workers $OLLAMA_NUM_PARALLEL > /var/log/ai-enrichment.log 2>&1 &
+    # See note above: --workers MUST be 1 to keep the GPU semaphore effective.
+    nohup $VENV_DIR/bin/uvicorn main:app --host 0.0.0.0 --port $APP_PORT --workers 1 > /var/log/ai-enrichment.log 2>&1 &
     echo "[+] Service started (PID: $!). Log: /var/log/ai-enrichment.log"
 fi
 
@@ -5662,3 +6511,5 @@ echo ""
 echo "API Endpoint: http://$(hostname -I | awk '{print $1}'):${APP_PORT}"
 echo "Docs:        http://$(hostname -I | awk '{print $1}'):${APP_PORT}/docs"
 echo "------------------------------------------------"
+
+this is improved version
