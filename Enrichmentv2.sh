@@ -4531,16 +4531,7 @@ async def build_verified_b2b_record(query: str,
                 SOURCE_CONFIDENCE["companies_house"],
                 notes=["Nature of business (SIC) from Companies House"]))
 
-    if not record.get("nature_of_business_sic") and ch_sic_fallback:
-        fallback_sic = [str(code).strip() for code in (ch_sic_fallback.get("sic_codes") or []) if str(code).strip()]
-        if fallback_sic:
-            set_field("nature_of_business_sic", field_record(
-                fallback_sic,
-                "companies_house",
-                85,
-                notes=[f"Nature of business (SIC) from Companies House candidate (name score {ch_sic_fallback_score})"],
-            ))
-
+        # Registered office address — authoritative, always emit when present.
         ch_addr = format_registered_office_address(ch_primary.get("registered_office_address"))
         if ch_addr:
             set_field("registered_address", field_record(
@@ -4550,12 +4541,35 @@ async def build_verified_b2b_record(query: str,
             if any(bool(v) for v in ch_addr_fields.values()):
                 record["registered_address_fields"] = ch_addr_fields
 
+        # Active directors — authoritative, always emit when present.
+        # The companies_house_lookup_by_name() call above already fetched the
+        # /officers endpoint (or scraped the public officers page) and filtered
+        # out anyone with a resigned_on/ceased_on date. Surface the result here
+        # so /enrich-verified always populates `directors` once we have a CH
+        # company_number.
         directors = ch_primary.get("directors") or []
         if directors:
             set_field("directors", field_record(
                 directors, "companies_house",
                 SOURCE_CONFIDENCE["companies_house"],
                 notes=[f"{len(directors)} active directors from Companies House"]))
+        elif company_number:
+            # Make the absence explicit instead of silently returning null:
+            # either the company genuinely has no active directors recorded,
+            # or the officers lookup failed (network error, scrape miss).
+            record["validation_notes"].append(
+                f"No active directors returned by Companies House for company {company_number}"
+            )
+
+    if not record.get("nature_of_business_sic") and ch_sic_fallback:
+        fallback_sic = [str(code).strip() for code in (ch_sic_fallback.get("sic_codes") or []) if str(code).strip()]
+        if fallback_sic:
+            set_field("nature_of_business_sic", field_record(
+                fallback_sic,
+                "companies_house",
+                85,
+                notes=[f"Nature of business (SIC) from Companies House candidate (name score {ch_sic_fallback_score})"],
+            ))
 
     # Fallback identity from overall_summary when no CH record was found.
     if not record["matched_company"] and overall_summary.get("company_name"):
@@ -5204,6 +5218,47 @@ def discover_companies_house_web(query: str, max_results: int) -> List[Dict[str,
         return []
 
 
+def normalize_director_name(name: str) -> str:
+    """Format a Companies House officer name in normal title case.
+
+    The CH API returns names as "SMITH, John David" (last name uppercase,
+    comma, given names). Reorder to "John David Smith" and title-case the
+    whole thing while preserving common particles (Mc/Mac prefixes, hyphens,
+    and apostrophes in O'Brien-style names).
+    """
+    if not name:
+        return ""
+    text = str(name).strip()
+    if not text:
+        return ""
+    if "," in text:
+        last, _, rest = text.partition(",")
+        rest = rest.strip()
+        last = last.strip()
+        if rest:
+            text = f"{rest} {last}"
+        else:
+            text = last
+
+    def _cap_word(word: str) -> str:
+        if not word:
+            return word
+        if "-" in word:
+            return "-".join(_cap_word(p) for p in word.split("-"))
+        if "'" in word:
+            head, _, tail = word.partition("'")
+            return f"{head.capitalize()}'{tail.capitalize()}" if tail else head.capitalize()
+        low = word.lower()
+        if low.startswith("mc") and len(low) > 2:
+            return "Mc" + low[2:].capitalize()
+        if low.startswith("mac") and len(low) > 3 and low[3] not in "aeiou":
+            return "Mac" + low[3:].capitalize()
+        return low.capitalize()
+
+    parts = [_cap_word(p) for p in text.split()]
+    return " ".join(parts).strip()
+
+
 def companies_house_lookup_by_name(company_name: str) -> Optional[Dict[str, Any]]:
     """
     Lookup a company on Companies House and enrich with active status + directors.
@@ -5353,7 +5408,7 @@ def companies_house_lookup_by_name(company_name: str) -> Optional[Dict[str, Any]
                     if dob_month and dob_year:
                         dob_text = f"{dob_month}/{dob_year}"
                     director_rows.append({
-                        "name": str(item.get("name") or "").strip(),
+                        "name": normalize_director_name(item.get("name") or ""),
                         "title": "Director",
                         "appointed_on": item.get("appointed_on"),
                         "date_of_birth_month_year": dob_text,
@@ -5468,7 +5523,7 @@ def companies_house_lookup_by_name(company_name: str) -> Optional[Dict[str, Any]
                     if name:
                         date_parts = extract_officer_dates(text)
                         director_rows.append({
-                            "name": name,
+                            "name": normalize_director_name(name),
                             "title": "Director",
                             "appointed_on": date_parts["appointed_on"],
                             "date_of_birth_month_year": date_parts["date_of_birth_month_year"],
@@ -5488,7 +5543,7 @@ def companies_house_lookup_by_name(company_name: str) -> Optional[Dict[str, Any]
                         if name:
                             date_parts = extract_officer_dates(row_text)
                             director_rows.append({
-                                "name": name,
+                                "name": normalize_director_name(name),
                                 "title": "Director",
                                 "appointed_on": date_parts["appointed_on"],
                                 "date_of_birth_month_year": date_parts["date_of_birth_month_year"],
@@ -5518,7 +5573,7 @@ def companies_house_lookup_by_name(company_name: str) -> Optional[Dict[str, Any]
                         if "director" in detail_text and not is_inactive_officer_text(detail_text):
                             date_parts = extract_officer_dates(detail_text)
                             director_rows.append({
-                                "name": name,
+                                "name": normalize_director_name(name),
                                 "title": "Director",
                                 "appointed_on": date_parts["appointed_on"],
                                 "date_of_birth_month_year": date_parts["date_of_birth_month_year"],
