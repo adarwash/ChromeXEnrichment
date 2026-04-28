@@ -3825,7 +3825,7 @@ async def run_ai_website_rerank(query: str,
 def build_ai_business_summary_prompt(record: Dict[str, Any]) -> str:
     facts = []
     for key in ["matched_company", "company_number", "company_status",
-                "registered_address", "verified_address", "likely_website",
+                "registered_address", "site_address", "verified_address", "likely_website",
                 "industry", "nature_of_business_sic", "phones", "emails", "directors"]:
         item = record.get(key)
         if not item:
@@ -4144,6 +4144,8 @@ async def build_verified_b2b_record(query: str,
         "nature_of_business_sic": None,
         "registered_address": None,
         "registered_address_fields": None,
+        "site_address": None,
+        "site_address_fields": None,
         "verified_address": None,
         "verified_address_fields": None,
         "directors": None,
@@ -4534,6 +4536,45 @@ async def build_verified_b2b_record(query: str,
     website_addr = website_addr_result.get("address")
     website_label = website_addr_result.get("label")
     website_candidates_found = website_addr_result.get("candidates") or []
+
+    # Site address is the operating/building address from the official website,
+    # distinct from Companies House registered office.
+    site_addr_candidate: Optional[str] = None
+    site_addr_notes: List[str] = []
+    site_addr_source = "official_website"
+    site_addr_conf = SOURCE_CONFIDENCE["official_website"]
+    if website_addr:
+        site_addr_candidate = website_addr
+        if website_label == "website_single":
+            site_addr_notes.append("site address from official website (single address found)")
+        elif website_label == "website_main":
+            site_addr_notes.append("site address from official website (main/head office label)")
+    elif website_candidates_found:
+        # Ambiguous website: still surface a best-effort site address from the
+        # website instead of hiding it, while flagging ambiguity.
+        site_addr_candidate = str(website_candidates_found[0]).strip()
+        site_addr_source = "official_website+ambiguous"
+        site_addr_conf = max(50, SOURCE_CONFIDENCE["official_website"] - 15)
+        site_addr_notes.append(
+            f"website lists {len(website_candidates_found)} addresses; selected first candidate as site address"
+        )
+
+    if site_addr_candidate:
+        if record.get("registered_address") and isinstance(record["registered_address"], dict):
+            ch_addr_value = record["registered_address"].get("value")
+            if ch_addr_value:
+                signals = address_match_signals(ch_addr_value, site_addr_candidate, location)
+                if signals["same_postcode"] or signals["same_line1"]:
+                    site_addr_notes.append("matches Companies House registered postcode/line1")
+                elif signals["conflict"]:
+                    site_addr_notes.append("differs from Companies House registered office")
+                    record["mismatch_warnings"].append(
+                        f"site_address: website '{site_addr_candidate}' differs from Companies House '{ch_addr_value}'"
+                    )
+        set_field("site_address", field_record(site_addr_candidate, site_addr_source, site_addr_conf, notes=site_addr_notes))
+        site_fields = parse_address_fields(site_addr_candidate, location)
+        if any(bool(v) for v in site_fields.values()):
+            record["site_address_fields"] = site_fields
 
     verified_address_set = False
     if website_addr:
@@ -4953,15 +4994,14 @@ def normalize_director_name(name: str) -> str:
 
     The CH API returns names as "SMITH, John David" (last name uppercase,
     comma, given names). Reorder to "John David Smith" and title-case the
-    whole thing while preserving common particles ("de la", "van", "von",
-    Mc/Mac prefixes, and apostrophes in O'Brien-style names).
+    whole thing while preserving common particles (Mc/Mac prefixes, hyphens,
+    and apostrophes in O'Brien-style names).
     """
     if not name:
         return ""
     text = str(name).strip()
     if not text:
         return ""
-    # "SMITH, John David"  ->  "John David SMITH"
     if "," in text:
         last, _, rest = text.partition(",")
         rest = rest.strip()
@@ -4974,20 +5014,15 @@ def normalize_director_name(name: str) -> str:
     def _cap_word(word: str) -> str:
         if not word:
             return word
-        # Preserve hyphenated names (Mary-Jane) and apostrophes (O'Brien).
         if "-" in word:
             return "-".join(_cap_word(p) for p in word.split("-"))
         if "'" in word:
             head, _, tail = word.partition("'")
             return f"{head.capitalize()}'{tail.capitalize()}" if tail else head.capitalize()
         low = word.lower()
-        # Mc / Mac prefixes: "MCDONALD" -> "McDonald", "MACLEOD" -> "MacLeod".
         if low.startswith("mc") and len(low) > 2:
             return "Mc" + low[2:].capitalize()
         if low.startswith("mac") and len(low) > 3 and low[3] not in "aeiou":
-            # "MACHINE" stays uncapitalised; only treat as Mac<Surname> when
-            # the next letter is a consonant typical of Gaelic surnames
-            # (MacLeod, MacDonald). Simple heuristic, avoids false positives.
             return "Mac" + low[3:].capitalize()
         return low.capitalize()
 
@@ -6210,6 +6245,8 @@ async def enrich_verified_endpoint(request: CrawlBusinessesRequest):
             "company_number": ch_number,
             "company_status": ch_status,
             "registered_address": ch_address,
+            "site_address": summary.get("site_address") or summary.get("verified_address"),
+            "site_address_fields": summary.get("site_address_fields") or summary.get("verified_address_fields"),
             "verified_address": summary.get("verified_address") or ch_address,
             "verified_address_fields": summary.get("verified_address_fields"),
             "directors": ch_directors,
