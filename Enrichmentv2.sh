@@ -2756,7 +2756,35 @@ def normalize_best_address_text(best_address: Any) -> Optional[str]:
     return None
 
 
-def parse_address_fields(best_address_text: Optional[str], country_hint: Optional[str]) -> Dict[str, Optional[str]]:
+_UK_COUNTIES_SET = {
+    "vale of glamorgan", "greater london", "greater manchester",
+    "west midlands", "east midlands", "west yorkshire", "south yorkshire",
+    "north yorkshire", "east yorkshire", "west sussex", "east sussex",
+    "north lanarkshire", "south lanarkshire", "east lothian", "west lothian",
+    "mid lothian", "tyne and wear", "bath and north east somerset",
+    "berkshire", "buckinghamshire", "cambridgeshire", "cheshire", "cornwall",
+    "cumbria", "derbyshire", "devon", "dorset", "durham", "essex",
+    "gloucestershire", "hampshire", "herefordshire", "hertfordshire",
+    "kent", "lancashire", "leicestershire", "lincolnshire", "merseyside",
+    "middlesex", "norfolk", "northamptonshire", "northumberland",
+    "nottinghamshire", "oxfordshire", "rutland", "shropshire", "somerset",
+    "staffordshire", "suffolk", "surrey", "warwickshire", "wiltshire",
+    "worcestershire", "aberdeenshire", "angus", "argyll", "ayrshire",
+    "clackmannanshire", "dumfriesshire", "dunbartonshire", "fife",
+    "highland", "inverness", "kincardineshire", "lanarkshire", "moray",
+    "perthshire", "renfrewshire", "stirlingshire", "carmarthenshire",
+    "ceredigion", "conwy", "denbighshire", "flintshire", "gwynedd",
+    "monmouthshire", "pembrokeshire", "powys", "rhondda cynon taf",
+    "wrexham", "county antrim", "county armagh", "county down",
+    "county fermanagh", "county londonderry", "county tyrone",
+}
+
+
+def _is_uk_county(text: str) -> bool:
+    return bool(text) and text.strip().lower() in _UK_COUNTIES_SET
+
+
+def _parse_address_fields_regex(best_address_text: Optional[str], country_hint: Optional[str]) -> Dict[str, Optional[str]]:
     fields = {
         "line1": None,
         "line2": None,
@@ -2790,6 +2818,63 @@ def parse_address_fields(best_address_text: Optional[str], country_hint: Optiona
     postcode_match = re.search(postcode_regex, text, flags=re.IGNORECASE)
     if postcode_match:
         fields["postcode"] = postcode_match.group(1).upper().strip()
+
+    # If the address text has no commas (common on websites), insert comma
+    # boundaries around the postcode, recognised UK counties/regions and
+    # country tokens so the downstream splitter can extract structured fields.
+    if "," not in text:
+        uk_counties = [
+            "Vale of Glamorgan", "Greater London", "Greater Manchester",
+            "West Midlands", "East Midlands", "West Yorkshire", "South Yorkshire",
+            "North Yorkshire", "East Yorkshire", "West Sussex", "East Sussex",
+            "North Lanarkshire", "South Lanarkshire", "East Lothian", "West Lothian",
+            "Mid Lothian", "Tyne and Wear", "Bath and North East Somerset",
+            "Berkshire", "Buckinghamshire", "Cambridgeshire", "Cheshire", "Cornwall",
+            "Cumbria", "Derbyshire", "Devon", "Dorset", "Durham", "Essex",
+            "Gloucestershire", "Hampshire", "Herefordshire", "Hertfordshire",
+            "Kent", "Lancashire", "Leicestershire", "Lincolnshire", "Merseyside",
+            "Middlesex", "Norfolk", "Northamptonshire", "Northumberland",
+            "Nottinghamshire", "Oxfordshire", "Rutland", "Shropshire", "Somerset",
+            "Staffordshire", "Suffolk", "Surrey", "Warwickshire", "Wiltshire",
+            "Worcestershire", "Aberdeenshire", "Angus", "Argyll", "Ayrshire",
+            "Clackmannanshire", "Dumfriesshire", "Dunbartonshire", "Fife",
+            "Highland", "Inverness", "Kincardineshire", "Lanarkshire", "Moray",
+            "Perthshire", "Renfrewshire", "Stirlingshire", "Carmarthenshire",
+            "Ceredigion", "Conwy", "Denbighshire", "Flintshire", "Gwynedd",
+            "Monmouthshire", "Pembrokeshire", "Powys", "Rhondda Cynon Taf",
+            "Wrexham", "County Antrim", "County Armagh", "County Down",
+            "County Fermanagh", "County Londonderry", "County Tyrone",
+        ]
+        country_tokens = [
+            "United Kingdom", "Great Britain", "England", "Scotland", "Wales",
+            "Northern Ireland", "United States of America", "United States",
+        ]
+        injected = text
+        if fields["postcode"]:
+            injected = re.sub(
+                r"\s*" + re.escape(fields["postcode"]) + r"\s*",
+                ", " + fields["postcode"] + ", ",
+                injected,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+        # Inject one county boundary, preferring the longest match so multi-word
+        # counties like "Vale of Glamorgan" win over substrings like "Powys".
+        for token in sorted(uk_counties, key=len, reverse=True):
+            pattern = r"\s+(" + re.escape(token) + r")(?=$|\s|,)"
+            new_injected, n = re.subn(pattern, r", \1", injected, count=1, flags=re.IGNORECASE)
+            if n:
+                injected = new_injected
+                break
+        for token in sorted(country_tokens, key=len, reverse=True):
+            pattern = r"\s+(" + re.escape(token) + r")(?=$|\s|,)"
+            new_injected, n = re.subn(pattern, r", \1", injected, count=1, flags=re.IGNORECASE)
+            if n:
+                injected = new_injected
+                break
+        injected = re.sub(r"\s*,\s*,\s*", ", ", injected).strip(" ,")
+        if "," in injected:
+            text = injected
 
     parts = [p.strip() for p in text.split(",") if p.strip()]
     # Strip "Companies House default address" placeholder segments. Some CH
@@ -2830,6 +2915,15 @@ def parse_address_fields(best_address_text: Optional[str], country_hint: Optiona
         mapped = known_countries.get(country_hint.strip().lower())
         fields["country"] = mapped or country_hint.strip()
 
+    # If splitting yielded no usable parts (e.g. comma-less string with only a
+    # postcode), fall back to using the postcode-stripped text as line1 so
+    # site_address_fields is at least partially populated.
+    if not non_postcode_parts and parts:
+        stripped = re.sub(postcode_regex, "", parts[0], flags=re.IGNORECASE)
+        stripped = re.sub(r"\s+", " ", stripped).strip(" ,")
+        if stripped:
+            non_postcode_parts = [stripped]
+
     if non_postcode_parts:
         fields["line1"] = non_postcode_parts[0]
 
@@ -2847,10 +2941,106 @@ def parse_address_fields(best_address_text: Optional[str], country_hint: Optiona
         if us_city_state_match:
             fields["city"] = us_city_state_match.group(1).strip()
             fields["state_region"] = us_city_state_match.group(2).strip()
+        elif _is_uk_county(city_state_part):
+            fields["state_region"] = city_state_part.strip()
         else:
             fields["city"] = city_state_part.strip()
 
     return fields
+
+
+# --- LLM-first address parsing -------------------------------------------------
+AI_PARSE_ADDRESS_ENABLED = os.getenv("AI_PARSE_ADDRESS", "true").strip().lower() in ("1", "true", "yes", "on")
+_ADDRESS_PARSE_CACHE: Dict[str, Dict[str, Optional[str]]] = {}
+_ADDRESS_PARSE_CACHE_MAX = 2048
+_ADDRESS_FIELD_KEYS = ("line1", "line2", "city", "state_region", "postcode", "country")
+
+
+def _llm_parse_address_fields(text: str, country_hint: Optional[str]) -> Optional[Dict[str, Optional[str]]]:
+    if not text or not text.strip():
+        return None
+    cache_key = f"{(country_hint or '').strip().lower()}|{text.strip()}"
+    cached = _ADDRESS_PARSE_CACHE.get(cache_key)
+    if cached is not None:
+        return dict(cached)
+
+    prompt = (
+        "Split the postal address below into structured fields. Respond with JSON ONLY.\n"
+        "Schema: {\"line1\": string|null, \"line2\": string|null, \"city\": string|null, "
+        "\"state_region\": string|null, \"postcode\": string|null, \"country\": string|null}\n"
+        "Rules:\n"
+        "- line1 = building number + street (no city, no county, no postcode).\n"
+        "- line2 = secondary line such as estate, building name, suite (null if none).\n"
+        "- city = town or city only.\n"
+        "- state_region = county / region / US state (null if none).\n"
+        "- postcode = postal/ZIP code exactly as written, uppercase.\n"
+        "- country = ISO short name (UK, US, IE, etc.) if known, else null.\n"
+        "- Use null (not empty string) for unknown fields. Do not invent data.\n"
+        f"Country hint (may be wrong): {country_hint or 'unknown'}\n"
+        f"Address: {text.strip()}\n"
+    )
+
+    try:
+        model = get_address_model() if "get_address_model" in globals() else AI_MODEL_ADDRESS
+        kw = chat_kwargs(model) if "chat_kwargs" in globals() else {}
+        response = ollama.chat(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            format="json",
+            **kw,
+        )
+        content = response["message"]["content"]
+        parsed = json.loads(content)
+        if not isinstance(parsed, dict):
+            return None
+        result: Dict[str, Optional[str]] = {k: None for k in _ADDRESS_FIELD_KEYS}
+        for key in _ADDRESS_FIELD_KEYS:
+            value = parsed.get(key)
+            if value is None:
+                continue
+            if isinstance(value, (int, float)):
+                value = str(value)
+            if isinstance(value, str):
+                value = value.strip()
+                if value and value.lower() not in ("null", "none", "n/a", "na", ""):
+                    result[key] = value
+        if len(_ADDRESS_PARSE_CACHE) >= _ADDRESS_PARSE_CACHE_MAX:
+            _ADDRESS_PARSE_CACHE.pop(next(iter(_ADDRESS_PARSE_CACHE)))
+        _ADDRESS_PARSE_CACHE[cache_key] = dict(result)
+        return result
+    except Exception as exc:
+        logger.debug(f"LLM address parse failed: {exc}")
+        return None
+
+
+def _address_fields_score(fields: Dict[str, Optional[str]]) -> int:
+    return sum(1 for k in _ADDRESS_FIELD_KEYS if fields.get(k))
+
+
+def _merge_address_fields(primary: Dict[str, Optional[str]], fallback: Dict[str, Optional[str]]) -> Dict[str, Optional[str]]:
+    merged: Dict[str, Optional[str]] = {k: None for k in _ADDRESS_FIELD_KEYS}
+    for key in _ADDRESS_FIELD_KEYS:
+        merged[key] = primary.get(key) or fallback.get(key)
+    return merged
+
+
+def parse_address_fields(best_address_text: Optional[str], country_hint: Optional[str]) -> Dict[str, Optional[str]]:
+    regex_fields = _parse_address_fields_regex(best_address_text, country_hint)
+    if not AI_PARSE_ADDRESS_ENABLED:
+        return regex_fields
+    if not best_address_text or not str(best_address_text).strip():
+        return regex_fields
+    llm_fields = _llm_parse_address_fields(str(best_address_text), country_hint)
+    if not llm_fields:
+        return regex_fields
+    merged = _merge_address_fields(llm_fields, regex_fields)
+    regex_postcode = regex_fields.get("postcode")
+    llm_postcode = (merged.get("postcode") or "").strip()
+    if regex_postcode and (not llm_postcode or not re.search(r"[A-Za-z0-9]{3,}", llm_postcode)):
+        merged["postcode"] = regex_postcode
+    if _address_fields_score(merged) < _address_fields_score(regex_fields):
+        return regex_fields
+    return merged
 
 
 async def evaluate_business_address_request(request: VerifyBusinessAddressRequest) -> Dict[str, Any]:
