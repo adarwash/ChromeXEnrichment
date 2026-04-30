@@ -38,7 +38,11 @@ HAS_NVIDIA=false
 OLLAMA_NUM_PARALLEL=1
 OLLAMA_SCHED_SPREAD=0
 OLLAMA_MAX_LOADED_MODELS=1
+OLLAMA_MAX_QUEUE=64
 OLLAMA_KEEP_ALIVE="-1"
+OLLAMA_FLASH_ATTENTION=1
+OLLAMA_KV_CACHE_TYPE="q8_0"
+CUDA_VISIBLE_DEVICES=""
 MULTI_GPU_MODE="disabled"
 
 if command -v nvidia-smi &> /dev/null; then
@@ -53,18 +57,21 @@ if command -v nvidia-smi &> /dev/null; then
     # Force use of all detected GPUs for inference/workload spread.
     # Keep at least 1 worker/model slot even if detection returns empty.
     if [ "$GPU_COUNT" -gt 0 ]; then
-        OLLAMA_NUM_PARALLEL=$GPU_COUNT
-        # Allow at least 2 resident models per GPU when VRAM allows so that
-        # qwen3:32b (worker) and mistral-small:24b (summarizer) can co-reside
-        # without forcing eviction (~32+24 = ~56GB on a 80-98GB GPU).
-        if [ "$TOTAL_VRAM_MB" -gt 60000 ]; then
-            OLLAMA_MAX_LOADED_MODELS=$(( GPU_COUNT * 2 ))
-        else
-            OLLAMA_MAX_LOADED_MODELS=$GPU_COUNT
-        fi
+        # Pin visible devices explicitly so Ollama sees all detected GPUs.
+        CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((GPU_COUNT - 1)))
+        # NUM_PARALLEL=1 means each concurrent Ollama request gets its own
+        # runner instance. With SCHED_SPREAD=1, request 1 goes to GPU 0 and
+        # request 2 immediately goes to GPU 1, improving dual-GPU balance.
+        OLLAMA_NUM_PARALLEL=1
+        # One runner per GPU. Each qwen3:32b runner (~20GB) fills most of a
+        # 32GB GPU, so MAX=GPU_COUNT is the realistic ceiling.
+        OLLAMA_MAX_LOADED_MODELS=$GPU_COUNT
         OLLAMA_SCHED_SPREAD=1
-        MULTI_GPU_MODE="forced (${GPU_COUNT} GPUs, max_loaded=${OLLAMA_MAX_LOADED_MODELS})"
-        echo "[+] Forced GPU mode enabled. Ollama will use all detected GPUs (${GPU_COUNT}), max_loaded_models=${OLLAMA_MAX_LOADED_MODELS}."
+        OLLAMA_MAX_QUEUE=64
+        OLLAMA_FLASH_ATTENTION=1
+        OLLAMA_KV_CACHE_TYPE="q8_0"
+        MULTI_GPU_MODE="forced (${GPU_COUNT} GPUs, max_loaded=${OLLAMA_MAX_LOADED_MODELS}, num_parallel=${OLLAMA_NUM_PARALLEL})"
+        echo "[+] Forced GPU mode enabled. visible=${CUDA_VISIBLE_DEVICES}, max_loaded_models=${OLLAMA_MAX_LOADED_MODELS}, num_parallel=${OLLAMA_NUM_PARALLEL}."
     fi
 else
     echo "[!] No NVIDIA drivers found. Mode: CPU Only."
@@ -73,7 +80,13 @@ fi
 export OLLAMA_NUM_PARALLEL
 export OLLAMA_SCHED_SPREAD
 export OLLAMA_MAX_LOADED_MODELS
+export OLLAMA_MAX_QUEUE
 export OLLAMA_KEEP_ALIVE
+export OLLAMA_FLASH_ATTENTION
+export OLLAMA_KV_CACHE_TYPE
+if [ -n "$CUDA_VISIBLE_DEVICES" ]; then
+    export CUDA_VISIBLE_DEVICES
+fi
 
 # Check Disk Space
 AVAIL_DISK_GB=$(df -BG /opt | awk 'NR==2 {print $4}' | sed 's/G//')
@@ -119,7 +132,11 @@ configure_ollama_systemd_override() {
 Environment="OLLAMA_NUM_PARALLEL=$OLLAMA_NUM_PARALLEL"
 Environment="OLLAMA_SCHED_SPREAD=$OLLAMA_SCHED_SPREAD"
 Environment="OLLAMA_MAX_LOADED_MODELS=$OLLAMA_MAX_LOADED_MODELS"
+Environment="OLLAMA_MAX_QUEUE=$OLLAMA_MAX_QUEUE"
 Environment="OLLAMA_KEEP_ALIVE=-1"
+Environment="OLLAMA_FLASH_ATTENTION=$OLLAMA_FLASH_ATTENTION"
+Environment="OLLAMA_KV_CACHE_TYPE=$OLLAMA_KV_CACHE_TYPE"
+Environment="CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 OLLAMAOVR
     sudo mv /tmp/ollama-override.conf /etc/systemd/system/ollama.service.d/override.conf
 }
@@ -6833,6 +6850,23 @@ else
     echo "[+] Service started (PID: $!). Log: /var/log/ai-enrichment.log"
 fi
 
+# Pre-warm GPUs: send GPU_COUNT concurrent requests to Ollama so each GPU
+# eagerly loads the model rather than waiting for the first real request.
+if [ "$GPU_COUNT" -gt 1 ] && command -v ollama &>/dev/null; then
+    echo "[*] Pre-warming $GPU_COUNT GPUs (loading model onto all GPUs)..."
+    _WARMUP_PIDS=()
+    for _i in $(seq 1 $GPU_COUNT); do
+        curl -s -X POST http://127.0.0.1:11434/api/generate \
+            -d "{\"model\":\"${SELECTED_MODEL}\",\"prompt\":\"Hi\",\"stream\":false}" \
+            -o /dev/null &
+        _WARMUP_PIDS+=($!)
+    done
+    for _pid in "${_WARMUP_PIDS[@]}"; do wait $_pid; done
+    echo "[+] GPU pre-warm complete."
+    nvidia-smi --query-gpu=index,memory.used --format=csv,noheader 2>/dev/null | \
+        awk '{printf "    GPU %s: %s VRAM used\n", $1, $2}'
+fi
+
 echo "------------------------------------------------"
 echo " Installation Complete!"
 echo "------------------------------------------------"
@@ -6840,6 +6874,12 @@ echo "Hardware Detected:"
 echo "  GPUs: $GPU_COUNT"
 echo "  VRAM: ${TOTAL_VRAM_MB}MB"
 echo "  Multi-GPU: $MULTI_GPU_MODE"
+echo "  CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-all}"
+echo "  OLLAMA_NUM_PARALLEL: ${OLLAMA_NUM_PARALLEL}"
+echo "  OLLAMA_MAX_LOADED_MODELS: ${OLLAMA_MAX_LOADED_MODELS}"
+echo "  OLLAMA_MAX_QUEUE: ${OLLAMA_MAX_QUEUE}"
+echo "  OLLAMA_FLASH_ATTENTION: ${OLLAMA_FLASH_ATTENTION}"
+echo "  OLLAMA_KV_CACHE_TYPE: ${OLLAMA_KV_CACHE_TYPE}"
 echo "  Disk: ${AVAIL_DISK_GB}GB"
 echo ""
 echo "Selected AI Model: $SELECTED_MODEL"
