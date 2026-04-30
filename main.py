@@ -1213,7 +1213,8 @@ def clean_text_from_url(url: str):
     text: Optional[str] = None
     if html:
         try:
-            extracted = trafilatura.extract(html, include_comments=False)
+            with _TRAFILATURA_LOCK:
+                extracted = trafilatura.extract(html, include_comments=False)
             if extracted:
                 text = extracted
         except Exception:
@@ -1235,7 +1236,8 @@ def clean_text_from_url(url: str):
             # needs proper HTML input — calling it on plain text returns None.
             if rendered.lstrip().startswith("<"):
                 try:
-                    extracted = trafilatura.extract(rendered, include_comments=False)
+                    with _TRAFILATURA_LOCK:
+                        extracted = trafilatura.extract(rendered, include_comments=False)
                     if extracted and _text_has_contact_signals(extracted):
                         return extracted
                 except Exception:
@@ -1405,6 +1407,7 @@ _MOJEEK_DISABLED_UNTIL = 0.0
 _BRAVE_LOCK = threading.Lock()
 _BRAVE_LAST_CALL = 0.0
 _BRAVE_MIN_SPACING = 1.1  # seconds between Brave requests to dodge 429s
+_TRAFILATURA_LOCK = threading.Lock()  # lxml (via trafilatura) is NOT thread-safe; serialize access
 _BROWSER_SEARCH_DISABLED_UNTIL = 0.0
 
 def search_public_results(query: str, max_results: int, quality_mode: Optional[str] = None) -> List[Dict[str, str]]:
@@ -2687,12 +2690,6 @@ _ADDRESS_FIELD_KEYS = ("line1", "line2", "city", "state_region", "postcode", "co
 
 
 def _llm_parse_address_fields(text: str, country_hint: Optional[str]) -> Optional[Dict[str, Optional[str]]]:
-    """Ask the address model to split a free-form address into structured fields.
-
-    Returns a dict with the standard keys, or None on failure. Sync (blocking)
-    so it can be used from existing sync call sites; callers already run inside
-    a thread executor in the request lifecycle.
-    """
     if not text or not text.strip():
         return None
     cache_key = f"{(country_hint or '').strip().lower()}|{text.strip()}"
@@ -2761,43 +2758,21 @@ def _merge_address_fields(primary: Dict[str, Optional[str]], fallback: Dict[str,
 
 
 def parse_address_fields(best_address_text: Optional[str], country_hint: Optional[str]) -> Dict[str, Optional[str]]:
-    """LLM-first address parser with regex fallback.
-
-    1. Always run the regex parser to guarantee a deterministic postcode.
-    2. If the AI parser is enabled and the input has any free-form text, ask
-       the model to split the address. Cache results per (country, text).
-    3. Merge: prefer LLM values when present, fall back to regex (and always
-       trust the regex postcode if the LLM omitted one or returned an
-       obviously broken one).
-    4. If the LLM call fails or is disabled, return the regex result.
-    """
     regex_fields = _parse_address_fields_regex(best_address_text, country_hint)
-
     if not AI_PARSE_ADDRESS_ENABLED:
         return regex_fields
     if not best_address_text or not str(best_address_text).strip():
         return regex_fields
-
     llm_fields = _llm_parse_address_fields(str(best_address_text), country_hint)
     if not llm_fields:
         return regex_fields
-
     merged = _merge_address_fields(llm_fields, regex_fields)
-
-    # Always trust the regex-extracted postcode if the LLM omitted one or
-    # produced a string that doesn't look like a postal code.
     regex_postcode = regex_fields.get("postcode")
     llm_postcode = (merged.get("postcode") or "").strip()
-    if regex_postcode and (
-        not llm_postcode
-        or not re.search(r"[A-Za-z0-9]{3,}", llm_postcode)
-    ):
+    if regex_postcode and (not llm_postcode or not re.search(r"[A-Za-z0-9]{3,}", llm_postcode)):
         merged["postcode"] = regex_postcode
-
-    # If the LLM result is strictly worse than regex, prefer regex.
     if _address_fields_score(merged) < _address_fields_score(regex_fields):
         return regex_fields
-
     return merged
 
 
