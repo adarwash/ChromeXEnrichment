@@ -5,15 +5,16 @@
 # Features: GPU/VRAM Detection, Disk Space Checks, Smart Model Selection
 # ==============================================================================
 
-set -e # Exit on error
+set -Eeuo pipefail
 
 # Configuration
-APP_DIR="/opt/ai-enrichment"
+APP_DIR="${APP_DIR:-/opt/ai-enrichment}"
 VENV_DIR="$APP_DIR/venv"
-APP_USER="root"
-PYTHON_VERSION="python3"
-MIN_DISK_SPACE_GB=5
-APP_PORT=8000
+APP_USER="${APP_USER:-root}"
+PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-$APP_DIR/ms-playwright}"
+PYTHON_VERSION="${PYTHON_VERSION:-python3}"
+MIN_DISK_SPACE_GB=10
+APP_PORT="${APP_PORT:-8000}"
 
 echo "------------------------------------------------"
 echo " AI Enrichment System - Smart Installer"
@@ -29,7 +30,20 @@ fi
 # 1. System Update & Deps
 echo "[*] Updating system and installing hardware utils..."
 sudo apt-get update -y
-sudo apt-get install -y curl git python3-pip python3-venv build-essential pciutils lsof
+sudo apt-get install -y curl git python3-pip python3-venv build-essential pciutils lsof software-properties-common
+
+# ScrapeGraphAI 2.1.x requires Python 3.12+. Prefer the system interpreter on
+# Ubuntu 24.04+, otherwise install 3.12 from the widely used deadsnakes PPA.
+if ! "$PYTHON_VERSION" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 12) else 1)' 2>/dev/null; then
+    echo "[*] Python 3.12+ is required for ScrapeGraphAI. Installing Python 3.12..."
+    if ! apt-cache show python3.12 >/dev/null 2>&1; then
+        sudo add-apt-repository -y ppa:deadsnakes/ppa
+        sudo apt-get update -y
+    fi
+    sudo apt-get install -y python3.12 python3.12-venv python3.12-dev
+    PYTHON_VERSION="python3.12"
+fi
+echo "[+] Using $($PYTHON_VERSION --version 2>&1)"
 
 # Check for NVIDIA GPU and VRAM
 GPU_COUNT=0
@@ -155,7 +169,7 @@ MODEL_NAME=""
 SPECIALIST_MODEL_DEFAULT=""
 
 # Logic Tree
-if [ "$AVAIL_DISK_GB" -lt 6 ]; then
+if [ "$AVAIL_DISK_GB" -lt "$MIN_DISK_SPACE_GB" ]; then
     # Critical low space
     SELECTED_MODEL="llama3.2:1b"
     echo "[!] Critical Disk Space. Selecting tiny model: $SELECTED_MODEL"
@@ -163,8 +177,13 @@ elif [ "$HAS_NVIDIA" = true ] && [ "$TOTAL_VRAM_MB" -gt 45000 ] && [ "$AVAIL_DIS
     # High-end multi-GPU box with enough disk for a larger model.
     SELECTED_MODEL="qwen3:32b"
     echo "[+] High-end GPU host detected. Selecting larger model: $SELECTED_MODEL"
+elif [ "$HAS_NVIDIA" = true ] && [ "$TOTAL_VRAM_MB" -gt 20000 ] && [ "$AVAIL_DISK_GB" -gt 25 ]; then
+    # RTX 4090-class host (24GB): qwen3:32b quantized fits and gives materially
+    # better extraction quality than an 8B model.
+    SELECTED_MODEL="qwen3:32b"
+    echo "[+] 20GB+ GPU detected. Selecting model: $SELECTED_MODEL"
 elif [ "$HAS_NVIDIA" = true ] && [ "$TOTAL_VRAM_MB" -gt 10000 ]; then
-    # Good GPU (>=10GB VRAM)
+    # Good GPU (12-20GB VRAM)
     SELECTED_MODEL="llama3.1:8b"
     echo "[+] High Performance GPU detected. Selecting model: $SELECTED_MODEL"
 elif [ "$HAS_NVIDIA" = true ] && [ "$TOTAL_VRAM_MB" -gt 4000 ]; then
@@ -191,18 +210,23 @@ fi
 #   AI_MODEL_VALIDATOR_STRONG=qwen3:32b    (was qwen2.5:72b)
 #   AI_MODEL_SUMMARIZER=mistral-small:24b
 #   AI_MODEL_SUMMARIZER_STRONG=qwen3:32b
-export AI_MODEL_NAME=${AI_MODEL_NAME:-qwen3:32b}
-export AI_MODEL_MATCHER=${AI_MODEL_MATCHER:-qwen3:32b}
-export AI_MODEL_MATCHER_STRONG=${AI_MODEL_MATCHER_STRONG:-qwen3:32b}
-export AI_MODEL_VALIDATOR=${AI_MODEL_VALIDATOR:-qwen3:32b}
-export AI_MODEL_VALIDATOR_STRONG=${AI_MODEL_VALIDATOR_STRONG:-qwen3:32b}
-export AI_MODEL_SUMMARIZER=${AI_MODEL_SUMMARIZER:-mistral-small:24b}
-export AI_MODEL_SUMMARIZER_STRONG=${AI_MODEL_SUMMARIZER_STRONG:-qwen3:32b}
-# Fast-mode lightweight model. Used when quality_mode="fast" so latency-sensitive
-# requests don't pay the qwen3:32b/mistral-small:24b cost. Defaults to llama3.1:8b.
-export AI_MODEL_MATCHER_FAST=${AI_MODEL_MATCHER_FAST:-llama3.1:8b}
-export AI_MODEL_SUMMARIZER_FAST=${AI_MODEL_SUMMARIZER_FAST:-llama3.1:8b}
-export AI_MODEL_VALIDATOR_FAST=${AI_MODEL_VALIDATOR_FAST:-llama3.1:8b}
+export AI_MODEL_NAME=${AI_MODEL_NAME:-$SELECTED_MODEL}
+export AI_MODEL_MATCHER=${AI_MODEL_MATCHER:-$AI_MODEL_NAME}
+export AI_MODEL_MATCHER_STRONG=${AI_MODEL_MATCHER_STRONG:-$AI_MODEL_NAME}
+export AI_MODEL_VALIDATOR=${AI_MODEL_VALIDATOR:-$AI_MODEL_NAME}
+export AI_MODEL_VALIDATOR_STRONG=${AI_MODEL_VALIDATOR_STRONG:-$AI_MODEL_NAME}
+export AI_MODEL_SUMMARIZER=${AI_MODEL_SUMMARIZER:-$AI_MODEL_NAME}
+export AI_MODEL_SUMMARIZER_STRONG=${AI_MODEL_SUMMARIZER_STRONG:-$AI_MODEL_NAME}
+# Fast mode uses an 8B model on 4090-class/qwen3:32b hosts, while constrained
+# hosts reuse their already-small hardware-selected model.
+FAST_MODEL_DEFAULT="$AI_MODEL_NAME"
+if [ "$AI_MODEL_NAME" = "qwen3:32b" ]; then
+    FAST_MODEL_DEFAULT="llama3.1:8b"
+fi
+export AI_MODEL_MATCHER_FAST=${AI_MODEL_MATCHER_FAST:-$FAST_MODEL_DEFAULT}
+export AI_MODEL_SUMMARIZER_FAST=${AI_MODEL_SUMMARIZER_FAST:-$FAST_MODEL_DEFAULT}
+export AI_MODEL_VALIDATOR_FAST=${AI_MODEL_VALIDATOR_FAST:-$FAST_MODEL_DEFAULT}
+export SCRAPEGRAPH_MODEL=${SCRAPEGRAPH_MODEL:-$AI_MODEL_MATCHER}
 
 # Keep compatibility with existing installer variables used below.
 SELECTED_MODEL="$AI_MODEL_NAME"
@@ -241,7 +265,7 @@ if [ "$HAS_NVIDIA" = true ] && [ "$TOTAL_VRAM_MB" -gt 45000 ] && [ "$AVAIL_DISK_
 fi
 
 # Set environment variable allow-list for per-request model override.
-BASE_ALLOWED="qwen3:32b,qwen2.5:72b,mistral-small:24b"
+BASE_ALLOWED="$AI_MODEL_NAME,$AI_MODEL_MATCHER,$AI_MODEL_MATCHER_STRONG,$AI_MODEL_VALIDATOR,$AI_MODEL_VALIDATOR_STRONG,$AI_MODEL_SUMMARIZER,$AI_MODEL_SUMMARIZER_STRONG,$AI_MODEL_MATCHER_FAST,$AI_MODEL_VALIDATOR_FAST,$AI_MODEL_SUMMARIZER_FAST"
 if [ -n "$ALT_MODELS" ]; then
     BASE_ALLOWED="$BASE_ALLOWED,$ALT_MODELS"
 fi
@@ -250,28 +274,32 @@ export AI_MODEL_ALLOWED=${AI_MODEL_ALLOWED:-$BASE_ALLOWED}
 # 4. Create Directory Structure
 echo "[*] Setting up directories..."
 sudo mkdir -p $APP_DIR/app
+sudo mkdir -p "$PLAYWRIGHT_BROWSERS_PATH"
+sudo chown -R "$(id -u):$(id -g)" "$APP_DIR"
 cd $APP_DIR
 
 # 5. Python Environment
 echo "[*] Creating Python Virtual Environment..."
-python3 -m venv venv
+"$PYTHON_VERSION" -m venv venv
 source venv/bin/activate
 
 # 6. Requirements
 echo "[*] Installing Python dependencies..."
 cat > $APP_DIR/app/requirements.txt << 'REQEOF'
-fastapi==0.111.0
+fastapi>=0.111,<1.0
 uvicorn[standard]==0.30.1
 httpx==0.27.2
-pydantic>=2.9,<3.0
+pydantic>=2.12.5,<3.0
 phonenumbers==8.13.40
 email-validator==2.2.0
 trafilatura==1.8.0
 ollama>=0.6.1
 dnspython==2.6.1
-requests==2.32.3
-beautifulsoup4==4.12.3
+requests>=2.32.5,<3.0
+beautifulsoup4>=4.14.3,<5.0
 crawl4ai>=0.8.0
+playwright>=1.57,<2.0
+scrapegraphai==2.1.6
 REQEOF
 
 pip install --upgrade pip
@@ -279,8 +307,10 @@ pip install -r $APP_DIR/app/requirements.txt
 
 # Install headless Chromium for Crawl4AI's JS-rendering fallback fetcher.
 echo "[*] Installing Playwright Chromium for Crawl4AI..."
-python3 -m playwright install chromium
-python3 -m playwright install-deps chromium || true
+export PLAYWRIGHT_BROWSERS_PATH
+python -m playwright install chromium
+python -m playwright install-deps chromium || true
+sudo chown -R "$APP_USER:$APP_USER" "$APP_DIR"
 
 # 7. FastAPI Application Code
 echo "[*] Writing Application Code..."
@@ -290,16 +320,21 @@ import os
 import asyncio
 import re
 import time
+import ipaddress
+import socket
+import secrets
 import html as html_lib
 import smtplib
 import contextvars
 import threading
+from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import concurrent.futures as _cf
 from typing import Optional, List, Dict, Any, Literal
 from urllib.parse import urlparse, parse_qs, unquote, urljoin, quote_plus
 from pydantic import BaseModel, EmailStr, Field, model_validator
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 import requests
 import trafilatura
 import phonenumbers
@@ -313,6 +348,10 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Keep self-hosted B2B inputs local by default. Operators can explicitly opt
+# in before process start if they want ScrapeGraphAI's anonymous telemetry.
+os.environ.setdefault("SCRAPEGRAPHAI_TELEMETRY_ENABLED", "false")
 
 # Get Model Name from Environment (set by installer)
 AI_MODEL = os.getenv("AI_MODEL_NAME", "qwen3:32b")
@@ -344,6 +383,28 @@ def _env_int(name: str, default: int, min_value: int, max_value: int) -> int:
     except Exception:
         return default
     return max(min_value, min(max_value, val))
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+SCRAPEGRAPH_ENABLED = _env_bool("SCRAPEGRAPH_ENABLED", True)
+SCRAPEGRAPH_MODEL = os.getenv("SCRAPEGRAPH_MODEL", AI_MODEL_MATCHER).strip() or AI_MODEL_MATCHER
+SCRAPEGRAPH_BASE_URL = os.getenv(
+    "SCRAPEGRAPH_OLLAMA_BASE_URL",
+    os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434"),
+).strip()
+SCRAPEGRAPH_DEFAULT_MODE = os.getenv("SCRAPEGRAPH_DEFAULT_MODE", "auto").strip().lower()
+if SCRAPEGRAPH_DEFAULT_MODE not in {"auto", "off", "fallback", "augment", "only"}:
+    SCRAPEGRAPH_DEFAULT_MODE = "auto"
+SCRAPEGRAPH_TIMEOUT_S = _env_int("SCRAPEGRAPH_TIMEOUT_S", 150, 30, 600)
+SCRAPEGRAPH_MODEL_TOKENS = _env_int("SCRAPEGRAPH_MODEL_TOKENS", 8192, 2048, 32768)
+SCRAPEGRAPH_MAX_CONCURRENCY = _env_int("SCRAPEGRAPH_MAX_CONCURRENCY", 1, 1, 4)
+SCRAPEGRAPH_VERBOSE = _env_bool("SCRAPEGRAPH_VERBOSE", False)
+SCRAPEGRAPH_HEADLESS = _env_bool("SCRAPEGRAPH_HEADLESS", True)
+ENRICHMENT_API_KEY = os.getenv("ENRICHMENT_API_KEY", "").strip()
 
 WEBSITE_AI_RERANK_ENABLED = os.getenv("WEBSITE_AI_RERANK_ENABLED", "1").strip().lower() not in {
     "0", "false", "no", "off",
@@ -488,7 +549,7 @@ def resolve_request_model(requested: Optional[str]) -> Optional[str]:
 
 app = FastAPI(
     title="Chrome X AI Enrichment API",
-    description="""Self-hosted B2B company enrichment API powered by local AI (Ollama + llama3.1).
+    description="""Self-hosted B2B company discovery and enrichment API powered by local AI.
 
 Features:
 - **Zero-cost crawling** — no paid APIs required (optional Companies House API key for UK)
@@ -499,9 +560,24 @@ Features:
 - **Discovery mode** — search by query + location, discover and enrich multiple businesses
 - **Overall summary** — cross-referenced B2B profile with Companies House priority, verified phones, domains_scanned
 - **Parallel processing** — concurrent AI inference, Companies House lookups, and page crawling
+- **ScrapeGraphAI hybrid extraction** — schema-guided website extraction and optional AI web discovery
 """,
-    version="2.7.0"
+    version="3.0.0"
 )
+
+@app.middleware("http")
+async def optional_api_key_auth(request: Request, call_next):
+    """Protect operational endpoints when ENRICHMENT_API_KEY is configured."""
+    if not ENRICHMENT_API_KEY or request.url.path in {"/health", "/docs", "/openapi.json", "/redoc"}:
+        return await call_next(request)
+    supplied = (request.headers.get("x-api-key") or "").strip()
+    if not supplied:
+        authorization = (request.headers.get("authorization") or "").strip()
+        if authorization.lower().startswith("bearer "):
+            supplied = authorization[7:].strip()
+    if not supplied or not secrets.compare_digest(supplied, ENRICHMENT_API_KEY):
+        return JSONResponse(status_code=401, content={"detail": "Invalid or missing API key"})
+    return await call_next(request)
 
 @app.on_event("startup")
 async def _widen_default_executor() -> None:
@@ -543,6 +619,10 @@ class EnrichRequest(BaseModel):
         default="balanced",
         description="Quality preset for discovery/validation. 'high' enables stronger AI reranking when available.",
     )
+    scrapegraph_mode: Literal["auto", "off", "fallback", "augment", "only"] = Field(
+        default=SCRAPEGRAPH_DEFAULT_MODE,
+        description="ScrapeGraphAI policy: auto disables it in fast mode, uses fallback in balanced, and augmentation in high mode.",
+    )
 
     @model_validator(mode="after")
     def validate_identifiers(self):
@@ -553,7 +633,9 @@ class EnrichRequest(BaseModel):
         return self
 
 class BatchEnrichRequest(BaseModel):
-    domains: List[str]
+    domains: List[str] = Field(..., min_length=1, max_length=100)
+    quality_mode: Literal["fast", "balanced", "high"] = "balanced"
+    scrapegraph_mode: Literal["auto", "off", "fallback", "augment", "only"] = SCRAPEGRAPH_DEFAULT_MODE
 
 class VerifyEmailRequest(BaseModel):
     email: EmailStr
@@ -599,6 +681,20 @@ class CrawlBusinessesRequest(BaseModel):
         default="balanced",
         description="Quality preset for discovery/validation. 'high' enables stronger AI reranking when available.",
     )
+    scrapegraph_mode: Literal["auto", "off", "fallback", "augment", "only"] = Field(
+        default=SCRAPEGRAPH_DEFAULT_MODE,
+        description="ScrapeGraphAI extraction policy for discovered websites.",
+    )
+    scrapegraph_search: bool = Field(
+        default=False,
+        description="Use ScrapeGraphAI SearchGraph as an additional B2B discovery source. The /discover-businesses endpoint enables this automatically.",
+    )
+    scrapegraph_top_k: int = Field(
+        default=2,
+        ge=1,
+        le=5,
+        description="Maximum number of ranked candidate websites to process with ScrapeGraphAI.",
+    )
     verifier_timeout_s: Optional[int] = Field(
         default=None,
         ge=15,
@@ -630,6 +726,47 @@ class SystemStatus(BaseModel):
     ai_model_loaded: str
     hardware_mode: str
 
+class ScrapeGraphPerson(BaseModel):
+    name: str
+    role: Optional[str] = None
+    linkedin_url: Optional[str] = None
+
+class ScrapeGraphB2BRecord(BaseModel):
+    company_name: Optional[str] = None
+    trading_name: Optional[str] = None
+    description: Optional[str] = None
+    industry: Optional[str] = None
+    services: List[str] = Field(default_factory=list)
+    products: List[str] = Field(default_factory=list)
+    target_customers: List[str] = Field(default_factory=list)
+    address: Optional[str] = None
+    company_registration_number: Optional[str] = None
+    vat_number: Optional[str] = None
+    founded_year: Optional[int] = None
+    employee_count_text: Optional[str] = None
+    website: Optional[str] = None
+    phones: List[str] = Field(default_factory=list)
+    emails: List[str] = Field(default_factory=list)
+    directors: List[ScrapeGraphPerson] = Field(default_factory=list)
+    decision_makers: List[ScrapeGraphPerson] = Field(default_factory=list)
+    social_links: Dict[str, str] = Field(default_factory=dict)
+    technologies: List[str] = Field(default_factory=list)
+    certifications: List[str] = Field(default_factory=list)
+    evidence_notes: List[str] = Field(default_factory=list)
+
+class ScrapeGraphDiscoveredBusiness(BaseModel):
+    company_name: str
+    website: Optional[str] = None
+    location: Optional[str] = None
+    industry: Optional[str] = None
+    description: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[str] = None
+    source_url: Optional[str] = None
+
+class ScrapeGraphBusinessList(BaseModel):
+    businesses: List[ScrapeGraphDiscoveredBusiness] = Field(default_factory=list)
+
 # --- Core Logic: AI & Helpers ---
 
 def normalize_domain(raw_url: str) -> str:
@@ -640,18 +777,448 @@ def normalize_domain(raw_url: str) -> str:
     return host
 
 
+def validate_public_http_url(url: str) -> tuple[bool, str]:
+    """Reject non-web and non-public destinations before server-side fetches.
+
+    This API accepts caller-controlled URLs, so allowing loopback, RFC1918,
+    link-local, or cloud-metadata addresses would make the service an SSRF
+    proxy. Every resolved address must be globally routable.
+    """
+    try:
+        parsed = urlparse((url or "").strip())
+        if parsed.scheme.lower() not in {"http", "https"}:
+            return False, "only http and https URLs are allowed"
+        if parsed.username or parsed.password:
+            return False, "URLs containing credentials are not allowed"
+        host = (parsed.hostname or "").strip().lower().rstrip(".")
+        if not host:
+            return False, "URL has no hostname"
+        if host == "localhost" or host.endswith(".localhost"):
+            return False, "local hostnames are not allowed"
+
+        try:
+            literal = ipaddress.ip_address(host)
+            addresses = [literal]
+        except ValueError:
+            port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+            resolved = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+            addresses = list({ipaddress.ip_address(item[4][0].split("%", 1)[0]) for item in resolved})
+
+        if not addresses:
+            return False, "hostname did not resolve"
+        if any(not address.is_global for address in addresses):
+            return False, "URL resolves to a private, local, reserved, or non-routable address"
+        return True, "ok"
+    except Exception as exc:
+        return False, f"URL validation failed: {type(exc).__name__}"
+
+
+@lru_cache(maxsize=1)
+def _load_scrapegraph_graphs():
+    """Lazy-load optional ScrapeGraphAI graphs without risking API startup."""
+    try:
+        from scrapegraphai.graphs import SearchGraph, SmartScraperGraph
+        return SmartScraperGraph, SearchGraph, None
+    except Exception as exc:
+        return None, None, f"{type(exc).__name__}: {exc}"
+
+
+def scrapegraph_dependency_status() -> Dict[str, Any]:
+    smart_graph, search_graph, error = _load_scrapegraph_graphs()
+    return {
+        "enabled": SCRAPEGRAPH_ENABLED,
+        "available": bool(smart_graph and search_graph),
+        "model": _REQUEST_MODEL.get() or SCRAPEGRAPH_MODEL,
+        "default_mode": SCRAPEGRAPH_DEFAULT_MODE,
+        "error": error,
+    }
+
+
+def resolve_scrapegraph_mode(requested: Optional[str], quality_mode: Optional[str]) -> str:
+    mode = (requested or SCRAPEGRAPH_DEFAULT_MODE or "auto").strip().lower()
+    if mode not in {"auto", "off", "fallback", "augment", "only"}:
+        mode = "auto"
+    if mode == "auto":
+        quality = (quality_mode or "balanced").strip().lower()
+        return "off" if quality == "fast" else "augment" if quality == "high" else "fallback"
+    return mode
+
+
+def _scrapegraph_model_name() -> str:
+    return _REQUEST_MODEL.get() or SCRAPEGRAPH_MODEL or get_matcher_model()
+
+
+def _scrapegraph_config(max_results: Optional[int] = None, model: Optional[str] = None) -> Dict[str, Any]:
+    model = model or _scrapegraph_model_name()
+    provider_model = model if "/" in model else f"ollama/{model}"
+    llm_config: Dict[str, Any] = {
+        "model": provider_model,
+        "temperature": 0,
+        "model_tokens": SCRAPEGRAPH_MODEL_TOKENS,
+        "format": "json",
+    }
+    if provider_model.startswith("ollama/") and SCRAPEGRAPH_BASE_URL:
+        llm_config["base_url"] = SCRAPEGRAPH_BASE_URL
+    config: Dict[str, Any] = {
+        "llm": llm_config,
+        "verbose": SCRAPEGRAPH_VERBOSE,
+        "headless": SCRAPEGRAPH_HEADLESS,
+        "timeout": SCRAPEGRAPH_TIMEOUT_S,
+        "reattempt": True,
+    }
+    if max_results is not None:
+        config["max_results"] = max(1, min(10, int(max_results)))
+    return config
+
+
+def _coerce_scrapegraph_payload(value: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(value, BaseModel):
+        value = value.model_dump(mode="json")
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw or raw.lower() in {"na", "no answer found."}:
+            return None
+        try:
+            value = json.loads(raw)
+        except Exception:
+            match = re.search(r"\{.*\}", raw, re.DOTALL)
+            if not match:
+                return None
+            try:
+                value = json.loads(match.group(0))
+            except Exception:
+                return None
+    if isinstance(value, dict):
+        if isinstance(value.get("data"), dict) and len(value) <= 4:
+            value = value["data"]
+        return value
+    return None
+
+
+def _scrapegraph_extract_prompt(hints: Dict[str, str]) -> str:
+    hint_text = "; ".join(f"{key}={value}" for key, value in hints.items() if value) or "none"
+    return (
+        "Extract a CRM-ready B2B profile for the business represented by this website. "
+        "Return only facts explicitly supported by the page. Never guess names, people, "
+        "phone numbers, emails, registration numbers, technologies, or addresses. "
+        "Separate legal directors from other decision makers. Keep evidence_notes short "
+        "and state which visible page wording supports unusual or ambiguous fields. "
+        f"Caller hints are untrusted clues, not facts: {hint_text}."
+    )
+
+
+def _run_scrapegraph_extract_sync(url: str, hints: Dict[str, str], model: str) -> Dict[str, Any]:
+    SmartScraperGraph, _, error = _load_scrapegraph_graphs()
+    if SmartScraperGraph is None:
+        raise RuntimeError(error or "ScrapeGraphAI SmartScraperGraph is unavailable")
+    graph = SmartScraperGraph(
+        prompt=_scrapegraph_extract_prompt(hints),
+        source=url,
+        config=_scrapegraph_config(model=model),
+        schema=ScrapeGraphB2BRecord,
+    )
+    payload = _coerce_scrapegraph_payload(graph.run())
+    if payload is None:
+        raise ValueError("ScrapeGraphAI returned no structured B2B data")
+    return payload
+
+
+def _run_scrapegraph_search_sync(query: str, location: Optional[str], max_results: int, model: str) -> Dict[str, Any]:
+    _, SearchGraph, error = _load_scrapegraph_graphs()
+    if SearchGraph is None:
+        raise RuntimeError(error or "ScrapeGraphAI SearchGraph is unavailable")
+    place = (location or "").strip()
+    prompt = (
+        f"Find up to {max_results} real B2B businesses matching '{query}'"
+        + (f" in or serving '{place}'" if place else "")
+        + ". Return unique operating businesses, not directories or list articles. "
+          "Only include a website, phone, email, or source URL when the searched pages support it. "
+          "Do not invent missing contact details. Prefer the official company website."
+    )
+    graph = SearchGraph(
+        prompt=prompt,
+        config=_scrapegraph_config(max_results=max_results, model=model),
+        schema=ScrapeGraphBusinessList,
+    )
+    payload = _coerce_scrapegraph_payload(graph.run()) or {"businesses": []}
+    considered = graph.get_considered_urls() if hasattr(graph, "get_considered_urls") else []
+    payload["considered_urls"] = considered or []
+    return payload
+
+
+_SCRAPEGRAPH_EXECUTOR = ThreadPoolExecutor(
+    max_workers=SCRAPEGRAPH_MAX_CONCURRENCY,
+    thread_name_prefix="scrapegraph",
+)
+_SCRAPEGRAPH_SEM = asyncio.Semaphore(SCRAPEGRAPH_MAX_CONCURRENCY)
+
+
+async def run_scrapegraph_extract(url: str, hints: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    if not SCRAPEGRAPH_ENABLED:
+        return {"status": "disabled", "data": None, "source_url": url}
+    safe, reason = validate_public_http_url(url)
+    if not safe:
+        return {"status": "rejected", "data": None, "source_url": url, "detail": reason}
+    started = time.perf_counter()
+    active_model = _scrapegraph_model_name()
+    try:
+        loop = asyncio.get_running_loop()
+        async with _AI_EXTRACTION_SEM:
+            async with _SCRAPEGRAPH_SEM:
+                data = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        _SCRAPEGRAPH_EXECUTOR,
+                        _run_scrapegraph_extract_sync,
+                        url,
+                        hints or {},
+                        active_model,
+                    ),
+                    timeout=SCRAPEGRAPH_TIMEOUT_S,
+                )
+        return {
+            "status": "success",
+            "data": data,
+            "source_url": url,
+            "model": active_model,
+            "elapsed_ms": round((time.perf_counter() - started) * 1000),
+        }
+    except asyncio.TimeoutError:
+        logger.warning(f"ScrapeGraphAI extraction timed out after {SCRAPEGRAPH_TIMEOUT_S}s: {url}")
+        return {"status": "timeout", "data": None, "source_url": url}
+    except Exception as exc:
+        logger.warning(f"ScrapeGraphAI extraction failed for {url}: {type(exc).__name__}: {exc}")
+        return {"status": "error", "data": None, "source_url": url, "detail": type(exc).__name__}
+
+
+async def run_scrapegraph_search(query: str, location: Optional[str], max_results: int) -> Dict[str, Any]:
+    if not SCRAPEGRAPH_ENABLED:
+        return {"status": "disabled", "businesses": [], "considered_urls": []}
+    started = time.perf_counter()
+    active_model = _scrapegraph_model_name()
+    try:
+        loop = asyncio.get_running_loop()
+        async with _AI_EXTRACTION_SEM:
+            async with _SCRAPEGRAPH_SEM:
+                payload = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        _SCRAPEGRAPH_EXECUTOR,
+                        _run_scrapegraph_search_sync,
+                        query,
+                        location,
+                        max_results,
+                        active_model,
+                    ),
+                    timeout=SCRAPEGRAPH_TIMEOUT_S,
+                )
+        businesses = payload.get("businesses") if isinstance(payload.get("businesses"), list) else []
+        return {
+            "status": "success",
+            "businesses": businesses[:max_results],
+            "considered_urls": payload.get("considered_urls") or [],
+            "model": active_model,
+            "elapsed_ms": round((time.perf_counter() - started) * 1000),
+        }
+    except asyncio.TimeoutError:
+        logger.warning(f"ScrapeGraphAI discovery timed out after {SCRAPEGRAPH_TIMEOUT_S}s")
+        return {"status": "timeout", "businesses": [], "considered_urls": []}
+    except Exception as exc:
+        logger.warning(f"ScrapeGraphAI discovery failed: {type(exc).__name__}: {exc}")
+        return {
+            "status": "error",
+            "businesses": [],
+            "considered_urls": [],
+            "detail": type(exc).__name__,
+        }
+
+
+def should_run_scrapegraph(mode: str, ai_data: Optional[Dict[str, Any]], rank: int, top_k: int) -> bool:
+    if not SCRAPEGRAPH_ENABLED or mode == "off" or rank >= top_k:
+        return False
+    if mode in {"augment", "only"}:
+        return True
+    if not isinstance(ai_data, dict) or ai_data.get("error"):
+        return True
+    core_count = sum(bool(ai_data.get(key)) for key in ("company_name", "industry", "description"))
+    return core_count < 2
+
+
+def _unique_text(values: List[Any], limit: int = 25) -> List[str]:
+    output: List[str] = []
+    seen = set()
+    for value in values:
+        text = str(value or "").strip()
+        key = text.casefold()
+        if text and key not in seen:
+            seen.add(key)
+            output.append(text)
+        if len(output) >= limit:
+            break
+    return output
+
+
+def _as_list(value: Any) -> List[Any]:
+    if value in (None, "", {}):
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return list(value)
+    return [value]
+
+
+def merge_scrapegraph_enrichment(ai_data: Optional[Dict[str, Any]], sg_data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    base = dict(ai_data or {})
+    if not isinstance(sg_data, dict):
+        return base
+
+    scalar_map = {
+        "company_name": "company_name",
+        "trading_name": "trading_name",
+        "description": "description",
+        "industry": "industry",
+        "address": "headquarters_location",
+        "company_registration_number": "company_registration_number",
+        "vat_number": "vat_number",
+        "founded_year": "founded_year",
+        "employee_count_text": "employee_count_text",
+        "website": "website",
+    }
+    for source_key, target_key in scalar_map.items():
+        if not base.get(target_key) and sg_data.get(source_key) not in (None, "", [], {}):
+            base[target_key] = sg_data[source_key]
+
+    services = _unique_text(_as_list(base.get("services")) + _as_list(sg_data.get("services")))
+    products = _unique_text(_as_list(base.get("products")) + _as_list(sg_data.get("products")))
+    if services:
+        base["services"] = services
+    if products:
+        base["products"] = products
+    tags = _unique_text(_as_list(base.get("tags")) + services + products + _as_list(sg_data.get("technologies")))
+    if tags:
+        base["tags"] = tags
+
+    for list_key in ("target_customers", "technologies", "certifications", "evidence_notes"):
+        merged = _unique_text(_as_list(base.get(list_key)) + _as_list(sg_data.get(list_key)))
+        if merged:
+            base[list_key] = merged
+
+    people: List[Dict[str, str]] = []
+    for item in _as_list(base.get("directors")) + _as_list(sg_data.get("directors")):
+        if isinstance(item, BaseModel):
+            item = item.model_dump(mode="json")
+        if isinstance(item, dict) and str(item.get("name") or "").strip():
+            people.append({
+                "name": str(item.get("name")).strip(),
+                "title": str(item.get("title") or item.get("role") or "Director").strip(),
+                **({"linkedin_url": str(item.get("linkedin_url")).strip()} if item.get("linkedin_url") else {}),
+            })
+    if people:
+        seen_people = set()
+        unique_people = []
+        for person in people:
+            key = (person["name"].casefold(), person.get("title", "").casefold())
+            if key in seen_people:
+                continue
+            seen_people.add(key)
+            unique_people.append(person)
+        base["directors"] = unique_people
+
+    decision_makers = []
+    for item in _as_list(sg_data.get("decision_makers")):
+        if isinstance(item, BaseModel):
+            item = item.model_dump(mode="json")
+        if isinstance(item, dict) and item.get("name"):
+            decision_makers.append(item)
+    if decision_makers:
+        base["decision_makers"] = decision_makers
+
+    social = dict(base.get("social_links") or {})
+    for key, value in (sg_data.get("social_links") or {}).items():
+        if value and not social.get(key):
+            social[key] = value
+    if social:
+        base["social_links"] = social
+        if not base.get("linkedin_url") and social.get("linkedin"):
+            base["linkedin_url"] = social["linkedin"]
+    return base
+
+
+def merge_scrapegraph_contacts(
+    contact_details: Dict[str, List[str]],
+    sg_data: Optional[Dict[str, Any]],
+    country_hint: Optional[str],
+) -> Dict[str, List[str]]:
+    merged = {
+        "emails": list(contact_details.get("emails") or []),
+        "phones": list(contact_details.get("phones") or []),
+    }
+    if not isinstance(sg_data, dict):
+        return merged
+    extracted_emails = []
+    for item in _as_list(sg_data.get("emails")):
+        email = str(item or "").strip().lower()
+        if re.fullmatch(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", email):
+            extracted_emails.append(email)
+    merged["emails"] = _unique_text(merged["emails"] + extracted_emails, limit=10)
+    for raw_phone in _as_list(sg_data.get("phones")):
+        verified = verify_phone_offline(str(raw_phone), country_hint)
+        if verified and (verified.get("is_valid") or verified.get("is_possible")):
+            merged["phones"].append(verified["international"])
+    merged["phones"] = _unique_text(merged["phones"], limit=10)
+    return merged
+
+
+def candidates_from_scrapegraph(discovery: Dict[str, Any]) -> List[Dict[str, str]]:
+    candidates: List[Dict[str, str]] = []
+    seen_domains = set()
+    for business in discovery.get("businesses") or []:
+        if isinstance(business, BaseModel):
+            business = business.model_dump(mode="json")
+        if not isinstance(business, dict):
+            continue
+        raw_url = str(business.get("website") or business.get("source_url") or "").strip()
+        if raw_url and not raw_url.startswith(("http://", "https://")):
+            raw_url = f"https://{raw_url}"
+        safe, _ = validate_public_http_url(raw_url)
+        domain = normalize_domain(raw_url) if safe else ""
+        if not domain or domain in seen_domains:
+            continue
+        seen_domains.add(domain)
+        candidates.append({
+            "title": str(business.get("company_name") or domain),
+            "url": raw_url,
+            "domain": domain,
+            "source": "scrapegraph_search",
+        })
+    return candidates
+
+
 def fetch_html_from_url(url: str, allow_non_html: bool = False) -> Optional[str]:
     try:
-        resp = requests.get(
-            url,
-            timeout=6,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; B2BEnricher/1.0)"},
-        )
-        resp.raise_for_status()
-        if not allow_non_html and "text/html" not in resp.headers.get("content-type", "").lower():
-            return None
-        return resp.text
-    except Exception:
+        current_url = url
+        for _ in range(5):
+            safe, reason = validate_public_http_url(current_url)
+            if not safe:
+                logger.info(f"Blocked unsafe fetch URL {current_url!r}: {reason}")
+                return None
+            resp = requests.get(
+                current_url,
+                timeout=6,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; B2BEnricher/3.0)"},
+                allow_redirects=False,
+            )
+            if resp.status_code in {301, 302, 303, 307, 308}:
+                location = resp.headers.get("location")
+                if not location:
+                    return None
+                current_url = urljoin(current_url, location)
+                continue
+            resp.raise_for_status()
+            if not allow_non_html and "text/html" not in resp.headers.get("content-type", "").lower():
+                return None
+            return resp.text
+        logger.info(f"Fetch redirect limit exceeded for {url}")
+        return None
+    except Exception as exc:
+        logger.debug(f"Static fetch failed for {url}: {type(exc).__name__}")
         return None
 
 
@@ -669,6 +1236,10 @@ def fetch_html_with_crawl4ai(url: str, timeout_s: int = 25) -> Optional[str]:
     only after several consecutive failures so that one slow/antibot site
     doesn't disable JS rendering for every subsequent URL."""
     global _CRAWL4AI_AVAILABLE, _CRAWL4AI_DISABLED_UNTIL, _CRAWL4AI_CONSECUTIVE_FAILURES
+    safe, reason = validate_public_http_url(url)
+    if not safe:
+        logger.info(f"Blocked unsafe browser fetch URL {url!r}: {reason}")
+        return None
     if not _CRAWL4AI_AVAILABLE:
         return None
     if time.time() < _CRAWL4AI_DISABLED_UNTIL:
@@ -1428,11 +1999,20 @@ def normalize_directors(ai_data: Dict[str, Any], text_content: str) -> Dict[str,
 # tail-latency predictable on heavy LLMs like qwen3:32b.
 _AI_EXTRACTION_SEM = asyncio.Semaphore(1)
 
+# Bound end-to-end candidate work across all requests. Crawling every candidate
+# at once consumes browser threads and memory while the resulting LLM work can
+# only drain one call at a time on a single GPU.
+_CANDIDATE_ENRICHMENT_CONCURRENCY = _env_int(
+    "CANDIDATE_ENRICHMENT_CONCURRENCY", 4, 1, 16
+)
+_CANDIDATE_ENRICHMENT_SEM = asyncio.Semaphore(_CANDIDATE_ENRICHMENT_CONCURRENCY)
+
 # Hard ceiling for any single ollama.chat() call. Without this a single stuck
 # inference can hold the semaphore forever and cause the whole pipeline to
 # silently hang for the request budget. 120s is generous enough for qwen3:32b
 # on a single GPU but bounded enough to surface real problems quickly.
-_OLLAMA_CALL_TIMEOUT_S = 120
+_OLLAMA_CALL_TIMEOUT_S = _env_int("OLLAMA_CALL_TIMEOUT_S", 120, 15, 600)
+_OLLAMA_QUEUE_TIMEOUT_S = _env_int("OLLAMA_QUEUE_TIMEOUT_S", 30, 5, 300)
 
 async def run_ai_extraction(text_content: str,
                             hints: Optional[Dict[str, str]] = None,
@@ -1449,7 +2029,22 @@ async def run_ai_extraction(text_content: str,
         # Run synchronous ollama call in a thread executor
         _model = get_matcher_model(quality_mode)
         _kw = chat_kwargs(_model)
-        async with _AI_EXTRACTION_SEM:
+        queue_started = time.perf_counter()
+        try:
+            await asyncio.wait_for(
+                _AI_EXTRACTION_SEM.acquire(),
+                timeout=_OLLAMA_QUEUE_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"AI extraction queue timed out after {_OLLAMA_QUEUE_TIMEOUT_S}s "
+                f"(model={_model})"
+            )
+            return None
+        queue_elapsed = time.perf_counter() - queue_started
+        if queue_elapsed >= 1:
+            logger.info(f"AI extraction acquired queue after {queue_elapsed:.1f}s (model={_model})")
+        try:
             response = await asyncio.wait_for(
                 loop.run_in_executor(
                     None,
@@ -1457,6 +2052,8 @@ async def run_ai_extraction(text_content: str,
                 ),
                 timeout=_OLLAMA_CALL_TIMEOUT_S,
             )
+        finally:
+            _AI_EXTRACTION_SEM.release()
         content = response['message']['content']
         parsed = json.loads(content)
         if not isinstance(parsed, dict):
@@ -1495,12 +2092,13 @@ def check_smtp_connection(email: str):
     except Exception as e:
         return None, f"Undetermined ({type(e).__name__})"
 
-def clean_text_from_url(url: str):
+def clean_text_from_url(url: str, quality_mode: Optional[str] = None):
     html = fetch_html_from_url(url)
     text: Optional[str] = None
     if html:
         try:
-            extracted = trafilatura.extract(html, include_comments=False)
+            with _TRAFILATURA_LOCK:
+                extracted = trafilatura.extract(html, include_comments=False)
             if extracted:
                 text = extracted
         except Exception:
@@ -1513,7 +2111,7 @@ def clean_text_from_url(url: str):
     # JS-injected contact details that `requests`+`trafilatura` can't see.
     # SKIP in fast mode: Crawl4AI launches a headless browser per page and adds
     # 5-15s of latency. Fast mode trades JS-rendered sites for speed.
-    _fast_mode = (_REQUEST_QUALITY.get() or "").strip().lower() == "fast"
+    _fast_mode = (quality_mode or _REQUEST_QUALITY.get() or "").strip().lower() == "fast"
     if not _fast_mode and not _text_has_contact_signals(text):
         rendered = fetch_html_with_crawl4ai(url)
         if rendered:
@@ -1522,7 +2120,8 @@ def clean_text_from_url(url: str):
             # needs proper HTML input — calling it on plain text returns None.
             if rendered.lstrip().startswith("<"):
                 try:
-                    extracted = trafilatura.extract(rendered, include_comments=False)
+                    with _TRAFILATURA_LOCK:
+                        extracted = trafilatura.extract(rendered, include_comments=False)
                     if extracted and _text_has_contact_signals(extracted):
                         return extracted
                 except Exception:
@@ -1667,6 +2266,9 @@ def discover_business_urls(query: str,
             url = item.get("url") or ""
             if not domain or not url:
                 continue
+            safe, _ = validate_public_http_url(url)
+            if not safe:
+                continue
             if domain in blocked_domains or domain.endswith(".bing.com") or domain.endswith(".yahoo.com"):
                 continue
             if "/aclick" in url.lower() or "trafficguard.ai" in url.lower():
@@ -1692,6 +2294,7 @@ _MOJEEK_DISABLED_UNTIL = 0.0
 _BRAVE_LOCK = threading.Lock()
 _BRAVE_LAST_CALL = 0.0
 _BRAVE_MIN_SPACING = 1.1  # seconds between Brave requests to dodge 429s
+_TRAFILATURA_LOCK = threading.Lock()  # lxml (via trafilatura) is NOT thread-safe; serialize access
 _BROWSER_SEARCH_DISABLED_UNTIL = 0.0
 
 def search_public_results(query: str, max_results: int, quality_mode: Optional[str] = None) -> List[Dict[str, str]]:
@@ -5859,7 +6462,11 @@ def companies_house_lookup_by_name(company_name: str) -> Optional[Dict[str, Any]
 @app.get("/health", tags=["System"])
 async def health_check():
     """Returns API status and active AI model name."""
-    return {"status": "healthy", "model": AI_MODEL}
+    return {
+        "status": "healthy",
+        "model": AI_MODEL,
+        "scrapegraphai": scrapegraph_dependency_status(),
+    }
 
 @app.get("/models", tags=["System"])
 async def list_models():
@@ -5888,6 +6495,11 @@ async def list_models():
             "default_for_thinking_models": False,
             "per_request_field": "think",
         },
+        "scrapegraphai": {
+            **scrapegraph_dependency_status(),
+            "modes": ["auto", "off", "fallback", "augment", "only"],
+            "auto_policy": {"fast": "off", "balanced": "fallback", "high": "augment"},
+        },
     }
 
 @app.get("/system-info", tags=["System"])
@@ -5899,6 +6511,7 @@ async def system_info():
         return {
             "active_model": AI_MODEL,
             "ollama_models": [m['model'] for m in models.get('models', [])],
+            "scrapegraphai": scrapegraph_dependency_status(),
             "status": "Operational"
         }
     except Exception as e:
@@ -5939,6 +6552,7 @@ async def enrich_single(request: EnrichRequest):
                     model=request.model,
                     think=request.think,
                     quality_mode=request.quality_mode,
+                    scrapegraph_mode=request.scrapegraph_mode,
                 )
             )
 
@@ -5976,6 +6590,7 @@ async def enrich_single(request: EnrichRequest):
                         model=request.model,
                         think=request.think,
                         quality_mode=request.quality_mode,
+                        scrapegraph_mode=request.scrapegraph_mode,
                     )
                 )
 
@@ -5984,10 +6599,16 @@ async def enrich_single(request: EnrichRequest):
         if not target_url:
             raise HTTPException(status_code=400, detail="Could not resolve a target URL. Provide domain/linkedin_url or a company_name that can be discovered.")
 
-        text_content = await loop.run_in_executor(None, clean_text_from_url, target_url)
+        safe_url, safe_reason = validate_public_http_url(target_url)
+        if not safe_url:
+            raise HTTPException(status_code=400, detail=f"Target URL is not allowed: {safe_reason}")
 
-        if not text_content:
+        scrapegraph_mode = resolve_scrapegraph_mode(request.scrapegraph_mode, quality)
+        text_content = await loop.run_in_executor(None, clean_text_from_url, target_url, quality)
+
+        if not text_content and scrapegraph_mode == "off":
             raise HTTPException(status_code=400, detail="Could not extract content from resolved URL")
+        text_content = text_content or ""
 
         # 2. Async AI with hints
         hints = {
@@ -5999,7 +6620,20 @@ async def enrich_single(request: EnrichRequest):
             "linkedin_url": request.linkedin_url or "",
             "additional_context": request.additional_context or "",
         }
-        ai_data = await run_ai_extraction(text_content, hints=hints)
+        ai_data = None
+        if scrapegraph_mode != "only" and text_content:
+            ai_data = await run_ai_extraction(text_content, hints=hints)
+
+        scrapegraph_result: Dict[str, Any] = {
+            "status": "not_run",
+            "data": None,
+            "source_url": target_url,
+            "mode": scrapegraph_mode,
+        }
+        if should_run_scrapegraph(scrapegraph_mode, ai_data, rank=0, top_k=1):
+            scrapegraph_result = await run_scrapegraph_extract(target_url, hints)
+            scrapegraph_result["mode"] = scrapegraph_mode
+            ai_data = merge_scrapegraph_enrichment(ai_data, scrapegraph_result.get("data"))
 
         if not ai_data:
             ai_data = {"error": "AI processing failed"}
@@ -6012,6 +6646,11 @@ async def enrich_single(request: EnrichRequest):
         # Raw ai_data phones are LLM-extracted strings that may not be normalised.
         contact_details = extract_contact_details(
             text_content, country_hint=request.location or request.country
+        )
+        contact_details = merge_scrapegraph_contacts(
+            contact_details,
+            scrapegraph_result.get("data"),
+            request.location or request.country,
         )
         # Merge the caller-supplied phone hint if it validates.
         _hint_phone = (request.phone_number or "").strip()
@@ -6030,6 +6669,13 @@ async def enrich_single(request: EnrichRequest):
             "confidence": confidence,
             "processing_model": get_main_model(),
             "quality_mode": get_quality_mode(),
+            "extraction_engines": [
+                engine for engine in [
+                    "ollama_native" if scrapegraph_mode != "only" else None,
+                    "scrapegraphai" if scrapegraph_result.get("status") == "success" else None,
+                ] if engine
+            ],
+            "scrapegraph": scrapegraph_result,
         }
     finally:
         _REQUEST_QUALITY.reset(quality_token)
@@ -6047,18 +6693,41 @@ async def batch_enrich(request: BatchEnrichRequest):
     """
     async def process_one(domain: str):
         url = domain if domain.startswith("http") else f"https://{domain}"
-        text = await asyncio.get_event_loop().run_in_executor(None, clean_text_from_url, url)
-        if text:
-            data = await run_ai_extraction(text, hints={})
+        safe, reason = validate_public_http_url(url)
+        if not safe:
+            return {"domain": domain, "data": None, "status": "rejected", "detail": reason}
+        text = await asyncio.get_event_loop().run_in_executor(
+            None, clean_text_from_url, url, request.quality_mode,
+        )
+        mode = resolve_scrapegraph_mode(request.scrapegraph_mode, request.quality_mode)
+        if text or mode != "off":
+            text = text or ""
+            data = None if mode == "only" else await run_ai_extraction(
+                text, hints={}, quality_mode=request.quality_mode,
+            ) if text else None
+            scrapegraph_result: Dict[str, Any] = {"status": "not_run", "data": None, "mode": mode}
+            if should_run_scrapegraph(mode, data, rank=0, top_k=1):
+                scrapegraph_result = await run_scrapegraph_extract(url, {})
+                scrapegraph_result["mode"] = mode
+                data = merge_scrapegraph_enrichment(data, scrapegraph_result.get("data"))
             confidence = score_enrichment(data or {}, {}, text) if data else {"overall": 0, "band": "low", "reasons": ["ai_failed"], "signals": {"email_count": 0, "phone_count": 0}}
-            return {"domain": domain, "data": data, "confidence": confidence, "status": "success"}
+            return {
+                "domain": domain,
+                "data": data,
+                "confidence": confidence,
+                "status": "success" if data else "ai_failed",
+                "scrapegraph": scrapegraph_result,
+            }
         return {"domain": domain, "data": None, "status": "crawl_failed"}
 
-    # Create tasks for all domains
-    tasks = [process_one(d) for d in request.domains]
-    
-    # Run in parallel
-    results = await asyncio.gather(*tasks)
+    quality_token = _REQUEST_QUALITY.set(request.quality_mode)
+    try:
+        # Create tasks for all domains and run them concurrently. Local LLM
+        # calls remain bounded by the extractor/ScrapeGraphAI semaphores.
+        tasks = [process_one(d) for d in request.domains]
+        results = await asyncio.gather(*tasks)
+    finally:
+        _REQUEST_QUALITY.reset(quality_token)
     
     return {
         "total": len(request.domains),
@@ -6154,6 +6823,8 @@ async def crawl_businesses(request: CrawlBusinessesRequest):
     quality = (getattr(request, "quality_mode", "balanced") or "balanced").strip().lower()
     if quality not in QUALITY_MODES:
         quality = "balanced"
+    quality_token = _REQUEST_QUALITY.set(quality)
+    scrapegraph_mode = resolve_scrapegraph_mode(request.scrapegraph_mode, quality)
 
     discovery_cap = request.max_results
     if quality == "high":
@@ -6165,18 +6836,47 @@ async def crawl_businesses(request: CrawlBusinessesRequest):
     elif quality == "fast":
         discovery_cap = max(1, min(request.max_results, 8))
 
+    scrapegraph_discovery: Dict[str, Any] = {
+        "status": "not_requested",
+        "businesses": [],
+        "considered_urls": [],
+    }
+    loop = asyncio.get_running_loop()
+    legacy_future = loop.run_in_executor(
+        None,
+        discover_business_urls,
+        request.query,
+        request.location,
+        discovery_cap,
+        quality,
+        getattr(request, "phone", None),
+    )
     try:
-        candidates = await asyncio.get_event_loop().run_in_executor(
-            None,
-            discover_business_urls,
-            request.query,
-            request.location,
-            discovery_cap,
-            quality,
-            getattr(request, "phone", None),
-        )
+        if request.scrapegraph_search:
+            legacy_result, scrapegraph_discovery = await asyncio.gather(
+                legacy_future,
+                run_scrapegraph_search(request.query, request.location, discovery_cap),
+            )
+        else:
+            legacy_result = await legacy_future
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Discovery failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Discovery failed: {type(e).__name__}")
+
+    combined_candidates = candidates_from_scrapegraph(scrapegraph_discovery)
+    combined_candidates.extend(legacy_result or [])
+    candidates: List[Dict[str, str]] = []
+    seen_candidate_domains = set()
+    for item in combined_candidates:
+        domain = str(item.get("domain") or normalize_domain(item.get("url") or "")).lower()
+        if not domain or domain in seen_candidate_domains:
+            continue
+        seen_candidate_domains.add(domain)
+        candidate = dict(item)
+        candidate["domain"] = domain
+        candidate["_scrapegraph_rank"] = len(candidates)
+        candidates.append(candidate)
+        if len(candidates) >= discovery_cap:
+            break
 
     # Precompute Companies House lookup once per request instead of once per
     # candidate. This removes duplicate network calls and cuts latency
@@ -6263,14 +6963,17 @@ async def crawl_businesses(request: CrawlBusinessesRequest):
         }
 
     async def _enrich_candidate(item: Dict[str, str]):
-        text = await asyncio.get_event_loop().run_in_executor(None, clean_text_from_url, item["url"])
-        if not text:
+        text = await asyncio.get_event_loop().run_in_executor(
+            None, clean_text_from_url, item["url"], quality,
+        )
+        if not text and scrapegraph_mode == "off":
             return {
                 "title": item["title"],
                 "url": item["url"],
                 "domain": item["domain"],
                 "status": "crawl_failed",
             }
+        text = text or ""
 
         hints = {
             "discovery_query": request.query,
@@ -6315,13 +7018,33 @@ async def crawl_businesses(request: CrawlBusinessesRequest):
         if phone_match:
             is_aggregator = False
 
-        # Skip heavy AI extraction for known aggregator/directory/search pages.
-        # These rarely represent the target business and mostly add latency.
-        ai_data = None if is_aggregator else await run_ai_extraction(
-            text,
-            hints=hints,
-            quality_mode=quality,
-        )
+        # Skip heavy extraction for known aggregator/directory/search pages.
+        # In "only" mode ScrapeGraphAI replaces the native single-page LLM
+        # extractor; other modes retain the proven native path and merge only
+        # supported ScrapeGraphAI fields.
+        ai_data = None
+        if not is_aggregator and scrapegraph_mode != "only":
+            ai_data = await run_ai_extraction(
+                text,
+                hints=hints,
+                quality_mode=quality,
+            )
+        scrapegraph_result: Dict[str, Any] = {
+            "status": "not_run",
+            "data": None,
+            "source_url": item.get("url"),
+            "mode": scrapegraph_mode,
+        }
+        candidate_rank = int(item.get("_scrapegraph_rank") or 0)
+        if not is_aggregator and should_run_scrapegraph(
+            scrapegraph_mode,
+            ai_data,
+            rank=candidate_rank,
+            top_k=request.scrapegraph_top_k,
+        ):
+            scrapegraph_result = await run_scrapegraph_extract(item["url"], hints)
+            scrapegraph_result["mode"] = scrapegraph_mode
+            ai_data = merge_scrapegraph_enrichment(ai_data, scrapegraph_result.get("data"))
         companies_house = shared_companies_house
 
         if companies_house and isinstance(companies_house, dict):
@@ -6335,6 +7058,11 @@ async def crawl_businesses(request: CrawlBusinessesRequest):
         confidence = score_enrichment(ai_data or {}, hints, confidence_text) if ai_data else {"overall": 0, "band": "low", "reasons": ["ai_failed"], "signals": {"email_count": 0, "phone_count": 0}}
 
         contact_details = extract_contact_details(text, country_hint=request.location) if not is_aggregator else {"emails": [], "phones": []}
+        contact_details = merge_scrapegraph_contacts(
+            contact_details,
+            scrapegraph_result.get("data"),
+            request.location,
+        )
 
         if phone_match and isinstance(confidence, dict):
             # Hard, deterministic identity match — promote to a high-confidence
@@ -6359,11 +7087,19 @@ async def crawl_businesses(request: CrawlBusinessesRequest):
             "companies_house": companies_house,
             "contact_details": contact_details,
             "confidence": confidence,
+            "extraction_engines": [
+                engine for engine in [
+                    "ollama_native" if scrapegraph_mode != "only" and not is_aggregator else None,
+                    "scrapegraphai" if scrapegraph_result.get("status") == "success" else None,
+                ] if engine
+            ],
+            "scrapegraph": scrapegraph_result,
         }
 
     async def enrich_candidate(item: Dict[str, str]):
         try:
-            return await asyncio.wait_for(_enrich_candidate(item), timeout=candidate_timeout_s)
+            async with _CANDIDATE_ENRICHMENT_SEM:
+                return await asyncio.wait_for(_enrich_candidate(item), timeout=candidate_timeout_s)
         except asyncio.TimeoutError:
             logger.warning(f"Candidate enrichment timed out after {candidate_timeout_s}s: {item.get('url')}")
             return {
@@ -6464,7 +7200,14 @@ async def crawl_businesses(request: CrawlBusinessesRequest):
             except Exception:
                 results.append(_budget_timeout_result(item, reason="request_task_error"))
     domains_scanned = [
-        {"domain": r.get("domain"), "url": r.get("url"), "title": r.get("title"), "status": r.get("status")}
+        {
+            "domain": r.get("domain"),
+            "url": r.get("url"),
+            "title": r.get("title"),
+            "status": r.get("status"),
+            "source": r.get("source"),
+            "extraction_engines": r.get("extraction_engines") or [],
+        }
         for r in results
     ]
     overall_summary = build_overall_b2b_summary(request.query, request.location, results, domains_scanned=domains_scanned)
@@ -6600,10 +7343,14 @@ async def crawl_businesses(request: CrawlBusinessesRequest):
             logger.warning(f"Verified record build failed: {e}")
             verified_record = None
 
-    return {
+    response = {
         "query": request.query,
         "location": request.location,
         "discovered": len(candidates),
+        "discovery_engines": {
+            "public_search": True,
+            "scrapegraphai": scrapegraph_discovery,
+        },
         "domains_scanned": domains_scanned,
         "results": results,
         "processing_model": get_main_model(),
@@ -6621,13 +7368,34 @@ async def crawl_businesses(request: CrawlBusinessesRequest):
             "summarizer": get_summarizer_model(),
             "summarizer_strong": AI_MODEL_SUMMARIZER_STRONG,
             "active_summarizer": get_summarizer_model(quality),
+            "scrapegraph": _scrapegraph_model_name(),
             "allowed_for_request_override": AI_MODEL_ALLOWED,
         },
         "quality_mode": quality,
+        "scrapegraph_mode": scrapegraph_mode,
         "overall_summary": overall_summary,
         "verified_record": verified_record,
         "companies_house": shared_companies_house,
     }
+    _REQUEST_QUALITY.reset(quality_token)
+    if think_token is not None:
+        _REQUEST_THINK.reset(think_token)
+    if token is not None:
+        _REQUEST_MODEL.reset(token)
+    return response
+
+
+@app.post("/discover-businesses", tags=["Discovery"])
+async def discover_businesses_endpoint(request: CrawlBusinessesRequest):
+    """AI-assisted B2B discovery followed by the normal verification pipeline.
+
+    ScrapeGraphAI SearchGraph adds schema-guided web discovery; every returned
+    website is then re-crawled and scored by the existing enrichment pipeline.
+    This prevents a search-model answer from becoming CRM data without a
+    second, source-based validation pass.
+    """
+    discovery_request = request.model_copy(update={"scrapegraph_search": True})
+    return await crawl_businesses(discovery_request)
 
 
 @app.post("/enrich-verified", tags=["Enrichment"])
@@ -6754,7 +7522,6 @@ async def enrich_verified_endpoint(request: CrawlBusinessesRequest):
         "verifier_timeout_s": request.verifier_timeout_s,
         "verified_record": record,
     }
-
 PYEOF
 
 # 8. Service Configuration
@@ -6763,36 +7530,52 @@ if pidof systemd &> /dev/null; then
     echo "[*] Configuring Systemd Service..."
     configure_ollama_systemd_override
 
-    # Free target port if already in use
+    # Stop only our previous service. Never kill an unrelated process merely
+    # because it owns the configured port.
+    sudo systemctl stop ai-enrichment.service 2>/dev/null || true
     PORT_PIDS=$(sudo lsof -t -iTCP:${APP_PORT} -sTCP:LISTEN 2>/dev/null || true)
     if [ -n "${PORT_PIDS}" ]; then
-        echo "[!] Port ${APP_PORT} is in use. Stopping PID(s): ${PORT_PIDS}"
-        echo "${PORT_PIDS}" | xargs -r sudo kill -9
+        echo "[!] Port ${APP_PORT} is already used by PID(s): ${PORT_PIDS}. Set APP_PORT to a free port and retry."
+        exit 1
     fi
 
     cat > /etc/systemd/system/ai-enrichment.service << SVCEOF
 [Unit]
 Description=AI Data Enrichment FastAPI Service
-After=network.target ollama.service
+Wants=network-online.target
+After=network-online.target ollama.service
 
 [Service]
 User=$APP_USER
 Group=$APP_USER
 WorkingDirectory=$APP_DIR/app
 Environment="PATH=$VENV_DIR/bin"
-Environment="AI_MODEL_NAME=${AI_MODEL_NAME:-qwen3:32b}"
-Environment="AI_MODEL_MATCHER=${AI_MODEL_MATCHER:-qwen3:32b}"
-Environment="AI_MODEL_MATCHER_STRONG=${AI_MODEL_MATCHER_STRONG:-qwen2.5:72b}"
-Environment="AI_MODEL_VALIDATOR=${AI_MODEL_VALIDATOR:-qwen3:32b}"
-Environment="AI_MODEL_VALIDATOR_STRONG=${AI_MODEL_VALIDATOR_STRONG:-qwen2.5:72b}"
+Environment="PLAYWRIGHT_BROWSERS_PATH=$PLAYWRIGHT_BROWSERS_PATH"
+Environment="AI_MODEL_NAME=${AI_MODEL_NAME}"
+Environment="AI_MODEL_MATCHER=${AI_MODEL_MATCHER}"
+Environment="AI_MODEL_MATCHER_STRONG=${AI_MODEL_MATCHER_STRONG}"
+Environment="AI_MODEL_VALIDATOR=${AI_MODEL_VALIDATOR}"
+Environment="AI_MODEL_VALIDATOR_STRONG=${AI_MODEL_VALIDATOR_STRONG}"
 Environment="AI_MODEL_ADDRESS=${AI_MODEL_ADDRESS:-$SPECIALIST_MODEL_DEFAULT}"
 Environment="AI_MODEL_CLASSIFIER=${AI_MODEL_CLASSIFIER:-$SPECIALIST_MODEL_DEFAULT}"
-Environment="AI_MODEL_SUMMARIZER=${AI_MODEL_SUMMARIZER:-mistral-small:24b}"
-Environment="AI_MODEL_SUMMARIZER_STRONG=${AI_MODEL_SUMMARIZER_STRONG:-qwen3:32b}"
-Environment="AI_MODEL_MATCHER_FAST=${AI_MODEL_MATCHER_FAST:-llama3.1:8b}"
-Environment="AI_MODEL_VALIDATOR_FAST=${AI_MODEL_VALIDATOR_FAST:-llama3.1:8b}"
-Environment="AI_MODEL_SUMMARIZER_FAST=${AI_MODEL_SUMMARIZER_FAST:-llama3.1:8b}"
+Environment="AI_MODEL_SUMMARIZER=${AI_MODEL_SUMMARIZER}"
+Environment="AI_MODEL_SUMMARIZER_STRONG=${AI_MODEL_SUMMARIZER_STRONG}"
+Environment="AI_MODEL_MATCHER_FAST=${AI_MODEL_MATCHER_FAST}"
+Environment="AI_MODEL_VALIDATOR_FAST=${AI_MODEL_VALIDATOR_FAST}"
+Environment="AI_MODEL_SUMMARIZER_FAST=${AI_MODEL_SUMMARIZER_FAST}"
+Environment="AI_MODEL_ALLOWED=${AI_MODEL_ALLOWED}"
+Environment="SCRAPEGRAPH_ENABLED=${SCRAPEGRAPH_ENABLED:-1}"
+Environment="SCRAPEGRAPH_MODEL=${SCRAPEGRAPH_MODEL}"
+Environment="SCRAPEGRAPH_DEFAULT_MODE=${SCRAPEGRAPH_DEFAULT_MODE:-auto}"
+Environment="SCRAPEGRAPH_TIMEOUT_S=${SCRAPEGRAPH_TIMEOUT_S:-150}"
+Environment="SCRAPEGRAPH_MODEL_TOKENS=${SCRAPEGRAPH_MODEL_TOKENS:-8192}"
+Environment="SCRAPEGRAPH_MAX_CONCURRENCY=${SCRAPEGRAPH_MAX_CONCURRENCY:-1}"
+Environment="SCRAPEGRAPH_HEADLESS=${SCRAPEGRAPH_HEADLESS:-1}"
+Environment="SCRAPEGRAPH_VERBOSE=${SCRAPEGRAPH_VERBOSE:-0}"
+Environment="SCRAPEGRAPH_OLLAMA_BASE_URL=${SCRAPEGRAPH_OLLAMA_BASE_URL:-http://127.0.0.1:11434}"
+Environment="SCRAPEGRAPHAI_TELEMETRY_ENABLED=${SCRAPEGRAPHAI_TELEMETRY_ENABLED:-false}"
 Environment="COMPANIES_HOUSE_API_KEY=${COMPANIES_HOUSE_API_KEY:-}"
+Environment="ENRICHMENT_API_KEY=${ENRICHMENT_API_KEY:-}"
 Environment="OLLAMA_NUM_PARALLEL=$OLLAMA_NUM_PARALLEL"
 Environment="OLLAMA_KEEP_ALIVE=-1"
 # IMPORTANT: --workers MUST stay at 1. The app's _AI_EXTRACTION_SEM = Semaphore(1)
@@ -6819,29 +7602,39 @@ SVCEOF
 else
     echo "[!] Systemd not available. Starting service directly..."
     ensure_ollama_running
-    # Free target port if already in use
-    PORT_PIDS=$(sudo lsof -t -iTCP:${APP_PORT} -sTCP:LISTEN 2>/dev/null || true)
-    if [ -n "${PORT_PIDS}" ]; then
-        echo "[!] Port ${APP_PORT} is in use. Stopping PID(s): ${PORT_PIDS}"
-        echo "${PORT_PIDS}" | xargs -r sudo kill -9
-    fi
     # Kill any existing instance
     pkill -f "uvicorn main:app" 2>/dev/null || true
+    PORT_PIDS=$(sudo lsof -t -iTCP:${APP_PORT} -sTCP:LISTEN 2>/dev/null || true)
+    if [ -n "${PORT_PIDS}" ]; then
+        echo "[!] Port ${APP_PORT} is already used by PID(s): ${PORT_PIDS}. Set APP_PORT to a free port and retry."
+        exit 1
+    fi
     cd $APP_DIR/app
-    export AI_MODEL_NAME=${AI_MODEL_NAME:-qwen3:32b}
-    export AI_MODEL_MATCHER=${AI_MODEL_MATCHER:-qwen3:32b}
-    export AI_MODEL_MATCHER_STRONG=${AI_MODEL_MATCHER_STRONG:-qwen2.5:72b}
-    export AI_MODEL_VALIDATOR=${AI_MODEL_VALIDATOR:-qwen3:32b}
-    export AI_MODEL_VALIDATOR_STRONG=${AI_MODEL_VALIDATOR_STRONG:-qwen2.5:72b}
+    export AI_MODEL_NAME=${AI_MODEL_NAME}
+    export AI_MODEL_MATCHER=${AI_MODEL_MATCHER}
+    export AI_MODEL_MATCHER_STRONG=${AI_MODEL_MATCHER_STRONG}
+    export AI_MODEL_VALIDATOR=${AI_MODEL_VALIDATOR}
+    export AI_MODEL_VALIDATOR_STRONG=${AI_MODEL_VALIDATOR_STRONG}
     export AI_MODEL_ADDRESS=${AI_MODEL_ADDRESS:-$SPECIALIST_MODEL_DEFAULT}
     export AI_MODEL_CLASSIFIER=${AI_MODEL_CLASSIFIER:-$SPECIALIST_MODEL_DEFAULT}
-    export AI_MODEL_SUMMARIZER=${AI_MODEL_SUMMARIZER:-mistral-small:24b}
-    export AI_MODEL_SUMMARIZER_STRONG=${AI_MODEL_SUMMARIZER_STRONG:-qwen3:32b}
-    export AI_MODEL_MATCHER_FAST=${AI_MODEL_MATCHER_FAST:-llama3.1:8b}
-    export AI_MODEL_VALIDATOR_FAST=${AI_MODEL_VALIDATOR_FAST:-llama3.1:8b}
-    export AI_MODEL_SUMMARIZER_FAST=${AI_MODEL_SUMMARIZER_FAST:-llama3.1:8b}
+    export AI_MODEL_SUMMARIZER=${AI_MODEL_SUMMARIZER}
+    export AI_MODEL_SUMMARIZER_STRONG=${AI_MODEL_SUMMARIZER_STRONG}
+    export AI_MODEL_MATCHER_FAST=${AI_MODEL_MATCHER_FAST}
+    export AI_MODEL_VALIDATOR_FAST=${AI_MODEL_VALIDATOR_FAST}
+    export AI_MODEL_SUMMARIZER_FAST=${AI_MODEL_SUMMARIZER_FAST}
     export AI_MODEL_ALLOWED=${AI_MODEL_ALLOWED:-qwen3:32b,qwen2.5:72b,mistral-small:24b,qwen2.5:32b,llama3.1:8b}
     export COMPANIES_HOUSE_API_KEY=${COMPANIES_HOUSE_API_KEY:-}
+    export ENRICHMENT_API_KEY=${ENRICHMENT_API_KEY:-}
+    export SCRAPEGRAPH_ENABLED=${SCRAPEGRAPH_ENABLED:-1}
+    export SCRAPEGRAPH_MODEL=${SCRAPEGRAPH_MODEL}
+    export SCRAPEGRAPH_DEFAULT_MODE=${SCRAPEGRAPH_DEFAULT_MODE:-auto}
+    export SCRAPEGRAPH_TIMEOUT_S=${SCRAPEGRAPH_TIMEOUT_S:-150}
+    export SCRAPEGRAPH_MODEL_TOKENS=${SCRAPEGRAPH_MODEL_TOKENS:-8192}
+    export SCRAPEGRAPH_MAX_CONCURRENCY=${SCRAPEGRAPH_MAX_CONCURRENCY:-1}
+    export SCRAPEGRAPH_HEADLESS=${SCRAPEGRAPH_HEADLESS:-1}
+    export SCRAPEGRAPH_VERBOSE=${SCRAPEGRAPH_VERBOSE:-0}
+    export SCRAPEGRAPH_OLLAMA_BASE_URL=${SCRAPEGRAPH_OLLAMA_BASE_URL:-http://127.0.0.1:11434}
+    export SCRAPEGRAPHAI_TELEMETRY_ENABLED=${SCRAPEGRAPHAI_TELEMETRY_ENABLED:-false}
     export OLLAMA_NUM_PARALLEL=$OLLAMA_NUM_PARALLEL
     export OLLAMA_SCHED_SPREAD=$OLLAMA_SCHED_SPREAD
     export OLLAMA_MAX_LOADED_MODELS=$OLLAMA_MAX_LOADED_MODELS
@@ -6886,4 +7679,9 @@ echo "Selected AI Model: $SELECTED_MODEL"
 echo ""
 echo "API Endpoint: http://$(hostname -I | awk '{print $1}'):${APP_PORT}"
 echo "Docs:        http://$(hostname -I | awk '{print $1}'):${APP_PORT}/docs"
+if [ -n "${ENRICHMENT_API_KEY:-}" ]; then
+    echo "API auth:    enabled (X-API-Key or Bearer token)"
+else
+    echo "API auth:    disabled (set ENRICHMENT_API_KEY before install to enable)"
+fi
 echo "------------------------------------------------"
