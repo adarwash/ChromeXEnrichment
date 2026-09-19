@@ -117,6 +117,12 @@ class CompaniesHouse:
 
 
 class BraveSearch:
+    name = "brave"
+
+    @property
+    def configured(self):
+        return bool(self.token)
+
     def __init__(self, fetcher, token):
         self.fetcher, self.token = fetcher, token
 

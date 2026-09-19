@@ -10,7 +10,8 @@ ChromeX Enrichment V4 (Ubuntu 24.04+ / Python 3.12+)
   bash EnrichmentV4.sh --extract ./v4-source  # offline; no root or installation
   sudo bash EnrichmentV4.sh                  # install isolated service on 127.0.0.1:8001
 Optional install environment: APP_DIR, APP_PORT, COMPANIES_HOUSE_API_KEY,
-BRAVE_SEARCH_API_KEY, ENRICHMENT_API_KEY, CRAWLER_USER_AGENT.
+ENRICHMENT_API_KEY, CRAWLER_USER_AGENT. Default search is local with no paid API.
+Optional search: SEARCH_PROVIDER=searxng and SEARXNG_URL.
 Existing /etc/chromex-enrichment-v4.env is preserved on upgrades.
 HELP
 }
@@ -71,6 +72,10 @@ if [[ ! -e "$ENV_FILE" ]]; then
 import json, os, pathlib, secrets, sys
 values = {'ENRICHMENT_API_KEY': os.environ.get('ENRICHMENT_API_KEY') or secrets.token_urlsafe(36),
           'COMPANIES_HOUSE_API_KEY': os.environ.get('COMPANIES_HOUSE_API_KEY', ''),
+          'SEARCH_PROVIDER': os.environ.get('SEARCH_PROVIDER', 'local'),
+          'SEARXNG_URL': os.environ.get('SEARXNG_URL', 'http://127.0.0.1:8888'),
+          'SEARXNG_DAILY_LIMIT': os.environ.get('SEARXNG_DAILY_LIMIT', '100'),
+          'EXTERNAL_SEARCH_MONTHLY_LIMIT': os.environ.get('EXTERNAL_SEARCH_MONTHLY_LIMIT', '0'),
           'BRAVE_SEARCH_API_KEY': os.environ.get('BRAVE_SEARCH_API_KEY', ''),
           'CRAWLER_USER_AGENT': os.environ.get('CRAWLER_USER_AGENT', 'ChromeXEnrichment/4.0'),
           'ENRICHMENT_DB': '/var/lib/chromex-enrichment-v4/enrichment.sqlite3'}
@@ -159,6 +164,7 @@ trap - ERR
 rm -f "$BACKUP_SERVICE"
 echo "V4 installed: http://127.0.0.1:$APP_PORT/docs"
 echo "Configure API keys in $ENV_FILE, then restart chromex-enrichment-v4."
+echo 'Default search is local. Optional SearXNG setup: current/deploy/searxng/setup.sh'
 echo 'Calling integration must honor call_ready and run /call-check immediately before use.'
 exit 0
 __V4_PAYLOAD_BELOW__

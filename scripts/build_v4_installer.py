@@ -7,6 +7,8 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parent.parent
 files = sorted((ROOT / 'enrichment_v4').glob('*.py')) + [ROOT / p for p in ('requirements-v4.txt', 'requirements-v4-lock.txt', 'README-V4.md')]
+files += sorted(p for p in (ROOT / "deploy/searxng").glob("*") if p.name in {"compose.yml", "settings.yml", "setup.sh"})
+files.append(ROOT / "SEARCH-OPTIONS.md")
 buffer = io.BytesIO()
 with zipfile.ZipFile(buffer, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
     for path in files:

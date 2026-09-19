@@ -58,3 +58,25 @@ class DiscoveryRequest(BaseModel):
 class BatchRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     items: list[EnrichRequest] = Field(min_length=1, max_length=20)
+
+
+class CandidateItem(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    url: str = Field(min_length=1, max_length=2048)
+    title: str = Field(default="", max_length=500)
+    text: str = Field(default="", max_length=12000)
+
+    @field_validator("url")
+    @classmethod
+    def candidate_url(cls, value):
+        from .http import canonical_url, FetchError
+        try:
+            return canonical_url(value)
+        except FetchError:
+            raise ValueError("Expected a public HTTP/HTTPS website URL") from None
+
+
+class CatalogueImport(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    items: list[CandidateItem] = Field(min_length=1, max_length=500)
+    source: str = Field(default="operator_import", min_length=1, max_length=200)

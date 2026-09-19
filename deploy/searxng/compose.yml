@@ -1,0 +1,16 @@
+services:
+  searxng:
+    # Setup script resolves this to a digest before launch; upgrades are explicit.
+    image: ${SEARXNG_IMAGE:?Run setup.sh to resolve the official image digest}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8888:8080"
+    environment:
+      SEARXNG_SECRET: ${SEARXNG_SECRET:?Run setup.sh first}
+    volumes:
+      - ./settings.yml:/etc/searxng/settings.yml:ro
+      - searxng-cache:/var/cache/searxng
+    mem_limit: 512m
+    cpus: 1.0
+volumes:
+  searxng-cache:

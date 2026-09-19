@@ -6,7 +6,8 @@ from collections import defaultdict
 from .evidence import parse_page, legal_binding, related_page, director_support, contact_quote, site_links, valid_phone, DIRECTORY_HOSTS
 from .http import FetchError, canonical_url, publisher, DEADLINE
 from .models import EnrichRequest
-from .providers import CompaniesHouse, BraveSearch, legal_name, person_name, norm
+from .search import build_search
+from .providers import CompaniesHouse, legal_name, person_name, norm
 
 # Explicit publisher families; different URLs/subdomains are not extra sources.
 # Operators must review permission and common ownership before adding a source.
@@ -16,10 +17,10 @@ MAX_AGE = 86400
 
 
 class EnrichmentService:
-    def __init__(self, fetcher, store, ch_key="", search_key="", source_groups=None):
+    def __init__(self, fetcher, store, ch_key="", search_key="", source_groups=None, search_provider="local", searxng_url="http://127.0.0.1:8888", searxng_daily_limit=100):
         self.fetcher, self.store = fetcher, store
         self.ch = CompaniesHouse(fetcher, ch_key)
-        self.search = BraveSearch(fetcher, search_key)
+        self.search = build_search(store, fetcher, search_provider, search_key, searxng_url, searxng_daily_limit)
         self.source_groups = dict(DEFAULT_SOURCE_GROUPS if source_groups is None else source_groups)
 
     def enrich(self, request: EnrichRequest):
@@ -56,6 +57,12 @@ class EnrichmentService:
                 result["status"] = "needs_review"
             if not result["call_ready"]:
                 result["call_contact"] = None
+            # Cache candidate links for reuse, never calling approval. On the next
+            # job they must be fetched and verified again under normal freshness rules.
+            if result["call_ready"]:
+                links = [result["likely_website"]]
+                links.extend(e["url"] for e in evidence.get("external_company_matches", []))
+                self.store.index_candidates([{"url": url, "title": result["matched_company"], "text": " ".join([result["matched_company"], result["company_number"], *(result["phones"] or [])])} for url in dict.fromkeys(links)], source="previous_verification_candidate", preserve_existing=True)
             self.store.save(record_id, request.model_dump(), result)
             return result
 
@@ -78,7 +85,9 @@ class EnrichmentService:
 
         def search(query, count=10):
             try:
-                rows, _ = self.search.search(query, count=count)
+                rows, search_evidence = self.search.search(query, count=count)
+                if search_evidence.get("upstream_error"):
+                    errors.append(search_evidence["upstream_error"])
                 return rows
             except FetchError as exc:
                 errors.append(exc.as_dict())
@@ -156,7 +165,7 @@ class EnrichmentService:
         if not registered:
             reasons.append("no_current_natural_person_directors")
 
-        # Discover the official website using a licensed search API. A result's
+        # Discover the official website using the configured candidate search provider. A result's
         # title or snippet is never evidence. All candidates must be fetched.
         seed_urls = [r["url"] for r in search(f'"{profile["company_name"]}" "{number}"')]
         if request.domain:

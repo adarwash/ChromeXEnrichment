@@ -62,7 +62,7 @@ class FakeFetch:
 def setup(tmp_path):
     fetch = FakeFetch()
     store = Store(tmp_path / 'state.db')
-    service = EnrichmentService(fetch, store, 'test-ch', 'test-search')
+    service = EnrichmentService(fetch, store, 'test-ch', 'test-search', search_provider='brave')
     return service, fetch, store
 
 
@@ -153,7 +153,7 @@ def test_missing_registry_key_fails_closed(setup):
 
 def test_no_search_key_can_use_explicit_sources(setup):
     service, _, _ = setup
-    service.search.token = ''
+    service.search.upstream.token = ''
     result = service.enrich(request(corroboration_urls=['https://cqc.org.uk/location/acme']))
     assert result['call_ready']
     assert any(e['code'] == 'brave_search_key_missing' for e in result['source_errors'])

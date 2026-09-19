@@ -98,8 +98,9 @@ def retry_delay(value, default=300, now=None):
 
 
 class Fetcher:
-    def __init__(self, store, user_agent=USER_AGENT, website_spacing=3.0, search_spacing=1.1):
+    def __init__(self, store, user_agent=USER_AGENT, website_spacing=3.0, search_spacing=1.1, search_monthly_limit=0):
         self.store = store
+        self.search_monthly_limit = max(0, int(search_monthly_limit))
         self.user_agent = user_agent
         self.website_spacing = max(3.0, website_spacing)
         self.search_spacing = max(1.1, search_spacing)
@@ -169,6 +170,8 @@ class Fetcher:
                 reset_at = self.store.budget(rate_key, 5000 if kind != "web" else 200)
                 if reset_at:
                     raise FetchError("daily_source_budget_exhausted", current, reset_at)
+                if host == "api.search.brave.com" and not self.store.monthly_search_budget("brave", self.search_monthly_limit):
+                    raise FetchError("external_search_monthly_budget_exhausted", current)
                 try:
                     status, response_headers, body = self._wire(current, hdr)
                 except FetchError as exc:

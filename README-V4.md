@@ -1,8 +1,10 @@
-# ChromeX Enrichment V4
+# ChromeX Enrichment V4.1
+
+**Zero-budget default:** local catalogue search and direct checks; paid search is opt-in with a zero-request default. [Search options, CSV import and SearXNG setup](SEARCH-OPTIONS.md).
 
 V4 adds a strict UK company/contact verification service and a self-contained Ubuntu installer. It is an intentionally conservative successor to V3's verification pipeline: incomplete or conflicting evidence produces `needs_review`, never a degraded calling record.
 
-**Status: implementation and offline regression tests complete; live business accuracy has not yet been measured.** API keys and a labelled pilot are needed before production rollout. This is not a claim of 100% accuracy. Public records can lag changes, websites can be stale, and matching a published telephone does not prove who will answer it.
+**Status: implementation and offline regression tests complete; live business accuracy has not yet been measured.** A Companies House key and a labelled pilot are needed before production rollout. This is not a claim of 100% accuracy. Public records can lag changes, websites can be stale, and matching a published telephone does not prove who will answer it.
 
 ## What changed from V3
 
@@ -14,7 +16,7 @@ The V3 source reviewed was commit `a0ff73b` (the installer is the authoritative 
 - Verifier failures could produce a degraded `/enrich-verified` response assembled from discovery results, including the supplied phone and unverified people.
 - Search-engine HTML scraping and several crawling paths bypassed a shared request policy.
 
-V4 replaces these decisions with explicit evidence rules. V3 and its service are preserved for comparison and rollback. V4 runs separately on port **8001** and does not install/change Ollama, GPU drivers or models. The verification decision is deterministic and does not depend on an LLM. Existing V3 AI extraction, address parsing, SMTP checks and GPU/model-control endpoints are not reimplemented in V4. Do not blend V3's unverified data into V4's calling output.
+V4 replaces these decisions with explicit evidence rules. V3 remains a separate service. Its existing browser-search fallback is now wired to the actual browser renderer in both source copies; the other legacy behaviour is retained. V4 runs separately on port **8001** and does not install/change Ollama, GPU drivers or models. The verification decision is deterministic and does not depend on an LLM. Existing V3 AI extraction, address parsing, SMTP checks and GPU/model-control endpoints are not reimplemented in V4. Do not blend V3's unverified data into V4's calling output.
 
 ## Conditions for `call_ready: true`
 
@@ -42,7 +44,7 @@ Configure `SOURCE_GROUPS_JSON` as a domain-to-ownership-group mapping after revi
 Requests use:
 
 - Companies House API, with at least one second between requests, below its published 600 requests per five minutes limit for this installation. A key used by other applications still needs a shared upstream quota plan.
-- Brave Search API for discovery; search snippets are never accepted as facts. Search spacing defaults to 1.1 seconds and can be increased with `SEARCH_SPACING_SECONDS` for your plan. Obtain a plan permitting your enrichment use and any retained results.
+- Local SQLite catalogue search by default. Optional SearXNG offers self-hosted metasearch; optional Brave requires explicit selection and a positive persistent monthly HTTP-request allowance. Search snippets never become verified facts. See SEARCH-OPTIONS.md for source limits, costs and setup.
 - Website requests at least three seconds apart per registrable publisher, honoring longer robots delays/request rates. No browser impersonation, CAPTCHA solving, proxy rotation or block bypass.
 - SQLite-backed cooldowns shared by threads and surviving restarts. HTTP 401/403/429 and challenge pages open a cooldown. `Retry-After` seconds/date values are honored; 429 is not immediately retried.
 - At most two retries for transient network/5xx failures, exponential delays and jitter, followed by a cooldown on exhausted server/network failures.
@@ -68,9 +70,9 @@ sudoedit /etc/chromex-enrichment-v4.env
 sudo systemctl restart chromex-enrichment-v4
 ```
 
-Set `COMPANIES_HOUSE_API_KEY` and `BRAVE_SEARCH_API_KEY` in that root-only environment file. A random `ENRICHMENT_API_KEY` is generated on first install; keep it for the CRM's authenticated requests. Keys are not printed. Existing configuration is preserved during upgrades; update it explicitly with `sudoedit`.
+Set `COMPANIES_HOUSE_API_KEY` in that root-only environment file. `SEARCH_PROVIDER=local` and `EXTERNAL_SEARCH_MONTHLY_LIMIT=0` are the defaults; no paid search key is required. A random `ENRICHMENT_API_KEY` is generated on first install; keep it for the CRM's authenticated requests. Keys are not printed. Existing configuration is preserved during upgrades; update it explicitly with `sudoedit`.
 
-A Companies House key is required for verification. A Brave key enables automatic website discovery/corroboration and sector discovery. Without Brave, an explicit `domain`, legal company identity and sufficient `corroboration_urls` can still be verified. Without Companies House, records cannot pass the strict gate.
+A Companies House key is required for verification. Import permitted business and corroboration URLs into the local catalogue for free candidate discovery, or provide explicit `domain` and `corroboration_urls`. Optional SearXNG can discover additional web candidates. Without Companies House, records cannot pass the strict gate. Existing configuration files are preserved on upgrade; missing search settings use the new zero-budget defaults.
 
 Service: `chromex-enrichment-v4.service`. Application: `/opt/chromex-enrichment-v4/current`. State: `/var/lib/chromex-enrichment-v4/enrichment.sqlite3`. Logs: `journalctl -u chromex-enrichment-v4`. It runs as the dedicated `chromex-enrichment` user, binds loopback only and requires an API key for data endpoints. Put your authenticated TLS reverse proxy in front if clients are remote. The installer stages versioned releases and restores the previous V4 release/service on failed startup. It does not stop V3 or kill unrelated port owners.
 
@@ -119,6 +121,8 @@ Response envelope:
 | `POST /discover-businesses` or `/crawl-businesses` | `{"query":"care homes", "location":"Hampshire", "max_results":5, "offset":0, "enrich":true}`; deduplicated website candidates, optionally verified individually |
 | `GET /records/{record_id}` | Retrieve audit evidence; expiry removes calling approval |
 | `POST /call-check/{record_id}` | Fresh repeat verification before a call; creates a new audit record |
+| `POST /catalogue/import` | Import up to 500 URL/title/text candidates; never verification approval |
+| `GET /catalogue/status` | Candidate count and optional external-search request usage |
 | `GET /system-info` | Configured providers, policy and approved publisher groups, without keys |
 
 The caller must:
@@ -144,6 +148,6 @@ bash -n EnrichmentV4.sh
 bash EnrichmentV4.sh --extract /tmp/chromex-v4-review
 ```
 
-Regression coverage includes positive verified records; wrong/ambiguous company names; wrong website/phone; renamed and resigned people; corporate/nominee directors; duplicate names; officer pagination and partial failures; stale evidence; shared publishers and copied text; missing keys; rate limits; robots denial; private DNS; authentication; and a director resigning between enrichment and pre-call refresh. Tests use fixtures and mocked HTTP, not real registry credentials. The root/systemd installation and real source coverage still need staging validation on the target Ubuntu host.
+Regression coverage includes positive verified records; wrong/ambiguous company names; wrong website/phone; renamed and resigned people; corporate/nominee directors; duplicate names; officer pagination and partial failures; stale evidence; shared publishers and copied text; missing keys; rate limits; robots denial; private DNS; authentication; and a director resigning between enrichment and pre-call refresh. Tests use fixtures and mocked HTTP, not real registry credentials. Additional search tests cover the zero-budget default, candidate imports, SearXNG responses and hard HTTP-request caps. The root/systemd installation and real source coverage still need staging validation on the target Ubuntu host.
 
 Before replacing the live queue, run V4 in shadow mode on a labelled sample of at least 100 businesses that includes known wrong-company, old-director, shared-office, trading-name, multi-site and changed-phone cases. Independently check legal entity, current director and business number. Record ready/review coverage, false approvals by field, source failures, request cost and latency. Investigate every false approval. Keep the conservative rules unless that evidence supports a reviewed change. This is how accuracy should be established; a high score from an AI model is not a measurement.
