@@ -78,6 +78,7 @@ values = {'ENRICHMENT_API_KEY': os.environ.get('ENRICHMENT_API_KEY') or secrets.
           'SEARXNG_DAILY_LIMIT': os.environ.get('SEARXNG_DAILY_LIMIT', '100'),
           'SCRAPLING_PYTHON': os.environ.get('SCRAPLING_PYTHON', '/opt/chromex-enrichment-v4/scrapling/bin/python'),
           'SCRAPLING_ENGINE': os.environ.get('SCRAPLING_ENGINE', 'bing'),
+          'SCRAPLING_BROWSER_PROFILE': os.environ.get('SCRAPLING_BROWSER_PROFILE', 'native'),
           'SCRAPLING_DAILY_LIMIT': os.environ.get('SCRAPLING_DAILY_LIMIT', '25'),
           'SCRAPLING_SOLVE_CLOUDFLARE': os.environ.get('SCRAPLING_SOLVE_CLOUDFLARE', '0'),
           'EXTERNAL_SEARCH_MONTHLY_LIMIT': os.environ.get('EXTERNAL_SEARCH_MONTHLY_LIMIT', '0'),

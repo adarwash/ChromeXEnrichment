@@ -1,6 +1,6 @@
-# ChromeX Enrichment V4.2
+# ChromeX Enrichment V4.2.1
 
-**Zero-budget default:** local catalogue search and direct checks; paid search is opt-in with a zero-request default. Optional Scrapling headless search supports Bing, Google or DuckDuckGo. [Search options, CSV import, Scrapling and SearXNG setup](SEARCH-OPTIONS.md).
+**Zero-budget default:** local catalogue search and direct checks; paid search is opt-in with a zero-request default. Optional Scrapling headless search supports Bing, Google or DuckDuckGo, with optional fixed/rotating desktop Chrome profiles. Profile changes do not change your public IP. [Search options, CSV import, Scrapling and SearXNG setup](SEARCH-OPTIONS.md).
 
 V4 adds a strict UK company/contact verification service and a self-contained Ubuntu installer. It is an intentionally conservative successor to V3's verification pipeline: incomplete or conflicting evidence produces `needs_review`, never a degraded calling record.
 

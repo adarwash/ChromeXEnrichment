@@ -103,6 +103,7 @@ Then edit `/etc/chromex-enrichment-v4.env` and restart V4:
 SEARCH_PROVIDER="scrapling"
 SCRAPLING_PYTHON="/opt/chromex-enrichment-v4/scrapling/bin/python"
 SCRAPLING_ENGINE="bing"
+SCRAPLING_BROWSER_PROFILE="native"
 SCRAPLING_DAILY_LIMIT="25"
 SCRAPLING_SOLVE_CLOUDFLARE="0"
 EXTERNAL_SEARCH_MONTHLY_LIMIT="0"
@@ -127,7 +128,25 @@ Operational bounds:
 
 Only recognised organic result links and titles are returned, marked `discovered_unverified`. Search snippets, adaptive selector guesses and CAPTCHA pages never establish directors or phone ownership. Browser discovery does not render blocked business websites for verification; insufficient source evidence still means `needs_review`.
 
-The Python dependency environment and offline adapter tests were checked here. The Chromium download timed out in this environment, so browser launch, live engine layouts and challenge success remain unvalidated. After installation on the target server, first try one known-business query, inspect source errors and check the returned company manually before increasing volume. No claim of 20,000 reliable free searches is made.
+### Browser profile option (V4.2.1)
+
+Set `SCRAPLING_BROWSER_PROFILE` in the V4 environment file, then restart the service:
+
+| Value | Behaviour |
+| --- | --- |
+| `native` | Default: Scrapling's normal Chromium identity. |
+| `chrome_windows` | Windows desktop Chrome identity, 1920×1080, scale 1. |
+| `chrome_macos` | macOS desktop Chrome identity, 1440×900, scale 2. |
+| `chrome_linux` | Linux desktop Chrome identity, 1366×768, scale 1. |
+| `rotate` | Randomly select one of the three emulated profiles for each uncached search. |
+
+For example, enable rotation with `SCRAPLING_BROWSER_PROFILE="rotate"`. The profile is selected once before starting the browser, not changed between its page/resource requests. Profiles set the page's user-agent, navigator platform, UA client hints, viewport, screen dimensions and scale. Reported browser versions come from the running Chromium instance. All emulated profiles use UK English and Europe/London time. They emulate desktop Chrome; they do not launch Firefox, Safari, Windows or macOS. This uses [Chromium's user-agent emulation](https://chromedevtools.github.io/devtools-protocol/tot/Emulation/#method-setUserAgentOverride) and [Playwright context emulation](https://playwright.dev/python/docs/emulation).
+
+**Browser identity is not network identity.** Profiles use the same server public IP and do not make requests originate from multiple machines. Fonts, GPU details, TLS behaviour and worker/iframe fingerprints are not fully emulated, so these profiles are not guaranteed to look like real independent devices. There is no measured reduction in blocking; inconsistent fingerprint surfaces can also increase detection. Use `native` as the baseline and compare before choosing rotation.
+
+Caches, daily allowances and cooldowns are shared across profiles. A cached result retains its original profile metadata; switching profiles does not trigger another request for it. Changing profile or selecting rotation never resets a block or immediately retries a rejected search. `/system-info` reports the configured profile mode; search evidence records the actual profile used and that the server IP is unchanged. Company/director/phone verification rules and the verification fetcher's identity are unaffected.
+
+The Python dependency environment and offline adapter tests were checked here. The Chromium download timed out in this environment, so browser launch, live engine layouts, profile emulation and challenge success remain unvalidated. After installation on the target server, first try one known-business query, inspect source errors and check the returned company manually before increasing volume. No claim of 20,000 reliable free searches is made.
 
 ## Existing V3 headless-browser/CAPTCHA option
 

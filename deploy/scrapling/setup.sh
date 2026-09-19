@@ -15,6 +15,7 @@ echo 'Browser dependencies installed. To enable, edit the V4 environment file:'
 echo 'SEARCH_PROVIDER="scrapling"'
 echo "SCRAPLING_PYTHON=\"$SCRAPLING_VENV/bin/python\""
 echo 'SCRAPLING_ENGINE="bing"'
+echo 'SCRAPLING_BROWSER_PROFILE="native"'
 echo 'SCRAPLING_DAILY_LIMIT="25"'
 echo 'SCRAPLING_SOLVE_CLOUDFLARE="0"'
 echo 'Then restart chromex-enrichment-v4. See SEARCH-OPTIONS.md for limitations.'

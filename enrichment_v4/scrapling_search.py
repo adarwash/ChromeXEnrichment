@@ -5,6 +5,7 @@ import hashlib
 import ipaddress
 import json
 import os
+import secrets
 from pathlib import Path
 import signal
 import subprocess
@@ -14,6 +15,7 @@ import time
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 from bs4 import BeautifulSoup
 from .http import FetchError, MAX_BYTES, canonical_url, publisher, remaining, retry_delay
+from .scrapling_worker import PROFILES
 
 ENGINES = {"google": "https://www.google.com/search", "bing": "https://www.bing.com/search",
            "duckduckgo": "https://html.duckduckgo.com/html/"}
@@ -87,12 +89,15 @@ class ScraplingSearch:
     name = "scrapling"
     configured = True
 
-    def __init__(self, store, python="/opt/chromex-enrichment-v4/scrapling/bin/python", engine="bing", daily_limit=25, solve_cloudflare=False):
+    def __init__(self, store, python="/opt/chromex-enrichment-v4/scrapling/bin/python", engine="bing", daily_limit=25, solve_cloudflare=False, browser_profile="native"):
         if engine not in ENGINES:
             raise ValueError("SCRAPLING_ENGINE must be bing, google or duckduckgo")
         if not python or not Path(python).is_absolute():
             raise ValueError("SCRAPLING_PYTHON must be the absolute path to the optional browser venv Python")
+        if browser_profile not in {"native", "rotate", *PROFILES}:
+            raise ValueError("SCRAPLING_BROWSER_PROFILE must be native, rotate, chrome_windows, chrome_macos or chrome_linux")
         self.store, self.python, self.engine = store, python, engine
+        self.browser_profile = browser_profile
         self.daily_limit, self.solve_cloudflare = max(0, int(daily_limit)), solve_cloudflare
 
     def _render(self, url):
@@ -102,7 +107,8 @@ class ScraplingSearch:
         with tempfile.TemporaryDirectory(prefix="chromex-browser-") as home:
             env = {"PATH": "/usr/bin:/bin", "HOME": home, "LANG": "C.UTF-8"}
             env["PLAYWRIGHT_BROWSERS_PATH"] = str(Path(self.python).parent.parent / "browsers")
-            payload = json.dumps({"url": url, "engine": self.engine, "solve_cloudflare": self.solve_cloudflare})
+            profile = secrets.choice(tuple(PROFILES)) if self.browser_profile == "rotate" else self.browser_profile
+            payload = json.dumps({"url": url, "engine": self.engine, "solve_cloudflare": self.solve_cloudflare, "browser_profile": profile})
             with tempfile.TemporaryFile() as output:
                 try:
                     proc = subprocess.Popen([self.python, "-I", str(worker)], stdin=subprocess.PIPE, stdout=output,
@@ -186,6 +192,7 @@ class ScraplingSearch:
                 self.store.block(rate_key, until)
                 raise FetchError(exc.code, retry_at=until) from None
             evidence = {"provider": self.name, "engine": self.engine, "url": url, "fetched_at": time.time(),
+                        "browser_profile": response.get("browser_profile", "unknown"), "network_identity": "server_public_ip_unchanged",
                         "notes": ["Browser search candidates only. No live CAPTCHA success or contact accuracy guarantee."]}
             self.store.cache(key, {"rows": rows, "evidence": evidence}, 86400)
             return rows[:count], evidence

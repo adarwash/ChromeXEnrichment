@@ -13,7 +13,7 @@ from enrichment_v4.api import create_app
 from enrichment_v4.http import DEADLINE, FetchError
 from enrichment_v4.models import DiscoveryRequest
 from enrichment_v4.scrapling_search import ScraplingSearch, parse_results, result_url, _BROWSER_SLOT
-from enrichment_v4.scrapling_worker import allowed_request, browser_setup, pinned_hosts, render
+from enrichment_v4.scrapling_worker import allowed_request, browser_setup, pinned_hosts, render, PROFILES, profile_identity
 from enrichment_v4.service import EnrichmentService
 from enrichment_v4.store import Store
 from test_v4 import FakeFetch, request
@@ -208,3 +208,76 @@ def test_subprocess_timeout_reaps_browser(search):
         search._render('https://www.bing.com/search?q=x')
     kill.assert_called_once()
     process.wait.assert_called_once()
+
+
+@pytest.mark.parametrize('profile', list(PROFILES))
+def test_profile_browser_version_and_headers_agree(profile):
+    identity = profile_identity(profile, 'HeadlessChrome/151.0.7922.34')
+    assert 'Chrome/151.0.0.0' in identity['userAgent']
+    assert {b['version'] for b in identity['userAgentMetadata']['brands']} == {'151'}
+    assert {b['version'] for b in identity['userAgentMetadata']['fullVersionList']} == {'151.0.7922.34'}
+    assert identity['platform'] == PROFILES[profile]['navigator_platform']
+    assert identity['userAgentMetadata']['platform'] == PROFILES[profile]['platform']
+
+
+def test_profile_applied_before_navigation_and_failure_closes_context():
+    page = Mock()
+    session = page.context.new_cdp_session.return_value
+    session.send.side_effect = [{'product': 'Chrome/151.0.7922.34'}, {}]
+    browser_setup({'www.bing.com'}, 'chrome_windows')(page)
+    assert session.send.call_args_list[1].args[0] == 'Emulation.setUserAgentOverride'
+    assert session.send.call_args_list[1].args[1]['platform'] == 'Win32'
+    session.send.side_effect = [{'product': 'Firefox/150'}]
+    with pytest.raises(ValueError, match='unknown_browser_version'):
+        browser_setup({'www.bing.com'}, 'chrome_windows')(page)
+    page.context.close.assert_called_once()
+
+
+def test_profile_choice_once_per_browser_with_no_cache_fragmentation(search):
+    search.browser_profile = 'rotate'
+    class FakeProcess:
+        pid = 1234567
+        returncode = 0
+        def __init__(self, args, **kwargs):
+            self.output = kwargs['stdout']
+        def communicate(self, data, **kwargs):
+            payload = json.loads(data)
+            assert payload['browser_profile'] == 'chrome_macos'
+            self.output.write(json.dumps({**response(), 'browser_profile': payload['browser_profile']}).encode())
+        def wait(self):
+            pass
+    with patch('subprocess.Popen', FakeProcess), patch('os.killpg'), patch('enrichment_v4.scrapling_search.secrets.choice', return_value='chrome_macos') as choose:
+        rows, evidence = search.search('care')
+        assert evidence['browser_profile'] == 'chrome_macos'
+        assert evidence['network_identity'] == 'server_public_ip_unchanged'
+        other = ScraplingSearch(Store(search.store.path), sys.executable, browser_profile='chrome_windows')
+        assert other.search('care') == (rows, evidence)
+        assert choose.call_count == 1
+
+
+def test_profile_change_cannot_reset_block(search):
+    with patch.object(search, '_render', return_value=response(status=429)), pytest.raises(FetchError):
+        search.search('care')
+    for profile in ('rotate', *PROFILES):
+        other = ScraplingSearch(Store(search.store.path), sys.executable, browser_profile=profile)
+        with patch.object(other, '_render') as render_page, pytest.raises(FetchError, match='cooldown'):
+            other.search('different')
+        render_page.assert_not_called()
+
+
+def test_profile_launch_dimensions_match_and_guards_remain():
+    fetcher = Mock()
+    fetcher.fetch.return_value = SimpleNamespace(url='https://www.bing.com/search', status=200, html_content=BING, headers={})
+    with patch.dict(sys.modules, {'scrapling.fetchers': SimpleNamespace(StealthyFetcher=fetcher)}), patch('enrichment_v4.scrapling_worker.pinned_hosts', return_value=('MAP * ~NOTFOUND', {'www.bing.com'})):
+        render({'url': 'https://www.bing.com/search?q=x', 'engine': 'bing', 'browser_profile': 'chrome_macos'})
+    args = fetcher.fetch.call_args.kwargs
+    assert args['additional_args']['viewport'] == args['additional_args']['screen'] == {'width': 1440, 'height': 900}
+    assert args['additional_args']['chromium_sandbox'] and args['additional_args']['service_workers'] == 'block'
+    assert args['locale'] == 'en-GB' and args['timezone_id'] == 'Europe/London'
+
+
+def test_invalid_browser_mode_rejected(search):
+    with pytest.raises(ValueError, match='BROWSER_PROFILE'):
+        ScraplingSearch(search.store, sys.executable, browser_profile='fake_firefox')
+    with pytest.raises(ValueError, match='invalid_browser_profile'):
+        render({'url': 'https://www.bing.com/search?q=x', 'engine': 'bing', 'browser_profile': 'fake_firefox'})

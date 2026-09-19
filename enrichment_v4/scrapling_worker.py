@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import ipaddress
 import json
+import re
 import resource
 import socket
 import sys
@@ -14,6 +15,32 @@ HOSTS = {
     "duckduckgo": {"html.duckduckgo.com", "duckduckgo.com", "links.duckduckgo.com"},
 }
 ROOTS = {"bing": ("www.bing.com", "/search"), "google": ("www.google.com", "/search"), "duckduckgo": ("html.duckduckgo.com", "/html/")}
+PROFILES = {
+    "chrome_windows": {"ua_platform": "Windows NT 10.0; Win64; x64", "navigator_platform": "Win32", "platform": "Windows", "platform_version": "15.0.0", "architecture": "x86", "width": 1920, "height": 1080, "scale": 1},
+    "chrome_macos": {"ua_platform": "Macintosh; Intel Mac OS X 10_15_7", "navigator_platform": "MacIntel", "platform": "macOS", "platform_version": "14.0.0", "architecture": "arm", "width": 1440, "height": 900, "scale": 2},
+    "chrome_linux": {"ua_platform": "X11; Linux x86_64", "navigator_platform": "Linux x86_64", "platform": "Linux", "platform_version": "", "architecture": "x86", "width": 1366, "height": 768, "scale": 1},
+}
+
+
+def profile_identity(profile, browser_version):
+    """Keep UA and client hints tied to the installed Chromium version."""
+    config = PROFILES[profile]
+    match = re.fullmatch(r"(?:HeadlessChrome|Chrome|Chromium)/(\d+\.\d+\.\d+\.\d+)", browser_version)
+    if not match:
+        raise ValueError("scrapling_unknown_browser_version")
+    version = match[1]
+    major = version.split('.')[0]
+    return {
+        "userAgent": f"Mozilla/5.0 ({config['ua_platform']}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36",
+        "platform": config["navigator_platform"],
+        "acceptLanguage": "en-GB,en;q=0.9",
+        "userAgentMetadata": {
+            "brands": [{"brand": "Chromium", "version": major}, {"brand": "Google Chrome", "version": major}],
+            "fullVersionList": [{"brand": "Chromium", "version": version}, {"brand": "Google Chrome", "version": version}],
+            "fullVersion": version, "platform": config["platform"], "platformVersion": config["platform_version"],
+            "architecture": config["architecture"], "bitness": "64", "model": "", "mobile": False, "wow64": False,
+        },
+    }
 
 
 def pinned_hosts(engine, solve_cloudflare=False):
@@ -44,7 +71,7 @@ def allowed_request(url, hosts):
         return False
 
 
-def browser_setup(allowed):
+def browser_setup(allowed, profile="native"):
     def setup(page):
         # Scrapling catches ordinary setup errors and continues; close the
         # context before rethrowing so a failed guard cannot permit navigation.
@@ -62,6 +89,10 @@ def browser_setup(allowed):
 
             page.context.route("**/*", route_request)
             page.context.route_web_socket("**/*", lambda ws: ws.close())
+            if profile != "native":
+                session = page.context.new_cdp_session(page)
+                version = session.send("Browser.getVersion")["product"]
+                session.send("Emulation.setUserAgentOverride", profile_identity(profile, version))
         except Exception:
             page.context.close()
             raise
@@ -74,20 +105,30 @@ def render(payload):
     if engine not in ROOTS or (p.hostname, p.path) != ROOTS[engine] or not allowed_request(url, HOSTS[engine]):
         raise ValueError("scrapling_invalid_search_url")
     solve = payload.get("solve_cloudflare") is True
+    profile = payload.get("browser_profile", "native")
+    if profile != "native" and profile not in PROFILES:
+        raise ValueError("scrapling_invalid_browser_profile")
     rules, allowed = pinned_hosts(engine, solve)
+    context_options = {"service_workers": "block", "accept_downloads": False, "chromium_sandbox": True}
+    profile_options = {}
+    if profile != "native":
+        config = PROFILES[profile]
+        dimensions = {k: config[k] for k in ("width", "height")}
+        context_options.update(viewport=dimensions, screen=dict(dimensions), device_scale_factor=config["scale"], is_mobile=False, has_touch=False)
+        profile_options = {"locale": "en-GB", "timezone_id": "Europe/London"}
     from scrapling.fetchers import StealthyFetcher
     response = StealthyFetcher.fetch(
         url, headless=True, timeout=60000, retries=1, google_search=False,
         solve_cloudflare=solve, block_webrtc=True, network_idle=False,
-        page_setup=browser_setup(allowed),
+        page_setup=browser_setup(allowed, profile),
         extra_flags=["--host-resolver-rules=" + rules, "--no-proxy-server", "--disable-quic",
                      "--disable-background-networking", "--dns-prefetch-disable"],
-        additional_args={"service_workers": "block", "accept_downloads": False, "chromium_sandbox": True},
+        additional_args=context_options, **profile_options,
     )
     html = response.html_content
     if len(html.encode()) > 2_000_000:
         raise ValueError("scrapling_response_too_large")
-    return {"url": response.url, "status": response.status, "html": html,
+    return {"url": response.url, "status": response.status, "html": html, "browser_profile": profile,
             "retry_after": next((v for k, v in response.headers.items() if k.lower() == "retry-after"), None)}
 
 

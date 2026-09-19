@@ -29,7 +29,7 @@ def create_app(service=None, api_key=None):
                 raise RuntimeError("SOURCE_GROUPS_JSON must map publisher domains to ownership groups")
             service = EnrichmentService(Fetcher(store, user_agent=os.getenv("CRAWLER_USER_AGENT", "ChromeXEnrichment/4.0"), search_spacing=float(os.getenv("SEARCH_SPACING_SECONDS", "1.1")), search_monthly_limit=int(os.getenv("EXTERNAL_SEARCH_MONTHLY_LIMIT", "0"))), store,
                                         os.getenv("COMPANIES_HOUSE_API_KEY", ""), os.getenv("BRAVE_SEARCH_API_KEY", ""), groups, search_provider=os.getenv("SEARCH_PROVIDER", "local"), searxng_url=os.getenv("SEARXNG_URL", "http://127.0.0.1:8888"), searxng_daily_limit=int(os.getenv("SEARXNG_DAILY_LIMIT", "100")),
-                                        scrapling_options={"python": os.getenv("SCRAPLING_PYTHON", "/opt/chromex-enrichment-v4/scrapling/bin/python"), "engine": os.getenv("SCRAPLING_ENGINE", "bing"), "daily_limit": int(os.getenv("SCRAPLING_DAILY_LIMIT", "25")), "solve_cloudflare": os.getenv("SCRAPLING_SOLVE_CLOUDFLARE", "0") == "1"})
+                                        scrapling_options={"python": os.getenv("SCRAPLING_PYTHON", "/opt/chromex-enrichment-v4/scrapling/bin/python"), "engine": os.getenv("SCRAPLING_ENGINE", "bing"), "daily_limit": int(os.getenv("SCRAPLING_DAILY_LIMIT", "25")), "solve_cloudflare": os.getenv("SCRAPLING_SOLVE_CLOUDFLARE", "0") == "1", "browser_profile": os.getenv("SCRAPLING_BROWSER_PROFILE", "native")})
         service.store.prune()
         app.state.service = service
         yield
@@ -68,6 +68,7 @@ def create_app(service=None, api_key=None):
     @app.get("/system-info", dependencies=protected)
     def system_info():
         return {"version": __version__, "companies_house_configured": bool(service.ch.token), "search_configured": service.search.configured, "search_provider": service.search.name, "external_search_monthly_limit": getattr(service.fetcher, "search_monthly_limit", 0), "catalogue": service.store.catalog_stats(),
+                "browser_profile": getattr(getattr(service.search, "upstream", None), "browser_profile", None),
                 "source_groups": service.source_groups, "policy": "strict", "scope": "UK registered companies", "max_parallel_jobs": 4}
 
     @app.post("/catalogue/import", dependencies=protected)
