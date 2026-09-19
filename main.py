@@ -1985,8 +1985,8 @@ def search_public_results(query: str, max_results: int, quality_mode: Optional[s
     rate-limited or returns nothing.
 
     Order: Mojeek -> Brave Search HTML -> DuckDuckGo HTML -> Yahoo HTML -> Bing HTML
-    -> Crawl4AI-rendered Bing/DDG (last resort, slow but bypasses UA/JS gates
-    that block our datacenter IP across all the static-HTTP backends).
+    -> Crawl4AI-rendered Bing/DDG (last resort for JavaScript rendering;
+    does not guarantee access past an IP block or interactive CAPTCHA).
     Each provider gets a process-level circuit breaker on failure to avoid
     paying connect timeouts repeatedly.
     """
@@ -2036,8 +2036,8 @@ def _decode_bing_redirect(href: str) -> str:
 
 def _search_with_crawl4ai(query: str, max_results: int) -> List[Dict[str, str]]:
     """Last-resort SERP fetcher: render Bing (then DuckDuckGo HTML) in headless
-    Chromium via Crawl4AI. This bypasses UA/JS challenges that block all the
-    static-HTTP backends from datacenter IPs. Slow (~5-15s/query) but reliable.
+    Chromium via Crawl4AI. This runs JavaScript when static fetching fails;
+    interactive CAPTCHAs and IP blocks can still return no usable results.
     """
     global _BROWSER_SEARCH_DISABLED_UNTIL
     if not _CRAWL4AI_AVAILABLE:
@@ -2061,11 +2061,11 @@ def _search_with_crawl4ai(query: str, max_results: int) -> List[Dict[str, str]]:
     seen_urls: set = set()
     any_engine_returned = False
     for engine, url in targets:
-        # Use requests-based fetch for search engine pages: Crawl4AI 0.8.x may
-        # return markdown (not HTML) which breaks BeautifulSoup link extraction.
-        # DDG's html/ endpoint and Bing both serve static HTML to curl-like
-        # agents; headless rendering adds latency without benefit here.
-        html = fetch_html_from_url(url)
+        # This is the browser fallback: actually invoke the Chromium renderer.
+        # The earlier static providers already attempted ordinary HTTP. Markdown
+        # or challenge pages contain no qualifying SERP links and yield no hits.
+        # Browser rendering is not an interactive CAPTCHA solver.
+        html = fetch_html_with_crawl4ai(url)
         if not html:
             continue
         soup = BeautifulSoup(html, "html.parser")

@@ -1,0 +1,29 @@
+# Local metasearch companion. Upstream access is best-effort, never guaranteed.
+# Review selected engine policies before use. No paid engine, proxy or bypass.
+use_default_settings:
+  engines:
+    keep_only:
+      - bing
+      - duckduckgo
+server:
+  bind_address: "0.0.0.0"
+  port: 8080
+  limiter: false  # accessible only through host loopback; V4 limits client traffic
+  public_instance: false
+search:
+  safe_search: 1
+  autocomplete: ""
+  favicon_resolver: ""
+  formats:
+    - html
+    - json
+  ban_time_on_fail: 300
+  max_ban_time_on_fail: 3600
+outgoing:
+  request_timeout: 10.0
+  max_request_timeout: 15.0
+engines:
+  - name: bing
+    disabled: false
+  - name: duckduckgo
+    disabled: false
