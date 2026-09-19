@@ -151,13 +151,16 @@ class CandidateSearch:
         return rows[:count], {"provider": self.name, "local": evidence, "upstream": remote_evidence}
 
 
-def build_search(store, fetcher, provider="local", brave_key="", searxng_url="http://127.0.0.1:8888", searxng_daily_limit=100):
+def build_search(store, fetcher, provider="local", brave_key="", searxng_url="http://127.0.0.1:8888", searxng_daily_limit=100, scrapling_options=None):
     if provider == "local":
         upstream = None
     elif provider == "searxng":
         upstream = SearXNGSearch(store, searxng_url, daily_limit=searxng_daily_limit)
     elif provider == "brave":
         upstream = BraveSearch(fetcher, brave_key)
+    elif provider == "scrapling":
+        from .scrapling_search import ScraplingSearch
+        upstream = ScraplingSearch(store, **(scrapling_options or {}))
     else:
-        raise ValueError("SEARCH_PROVIDER must be local, searxng or brave")
+        raise ValueError("SEARCH_PROVIDER must be local, searxng, scrapling or brave")
     return CandidateSearch(store, upstream)

@@ -12,6 +12,7 @@ ChromeX Enrichment V4 (Ubuntu 24.04+ / Python 3.12+)
 Optional install environment: APP_DIR, APP_PORT, COMPANIES_HOUSE_API_KEY,
 ENRICHMENT_API_KEY, CRAWLER_USER_AGENT. Default search is local with no paid API.
 Optional search: SEARCH_PROVIDER=searxng and SEARXNG_URL.
+Optional browser discovery: see SEARCH-OPTIONS.md and deploy/scrapling/setup.sh.
 Existing /etc/chromex-enrichment-v4.env is preserved on upgrades.
 HELP
 }
@@ -75,6 +76,10 @@ values = {'ENRICHMENT_API_KEY': os.environ.get('ENRICHMENT_API_KEY') or secrets.
           'SEARCH_PROVIDER': os.environ.get('SEARCH_PROVIDER', 'local'),
           'SEARXNG_URL': os.environ.get('SEARXNG_URL', 'http://127.0.0.1:8888'),
           'SEARXNG_DAILY_LIMIT': os.environ.get('SEARXNG_DAILY_LIMIT', '100'),
+          'SCRAPLING_PYTHON': os.environ.get('SCRAPLING_PYTHON', '/opt/chromex-enrichment-v4/scrapling/bin/python'),
+          'SCRAPLING_ENGINE': os.environ.get('SCRAPLING_ENGINE', 'bing'),
+          'SCRAPLING_DAILY_LIMIT': os.environ.get('SCRAPLING_DAILY_LIMIT', '25'),
+          'SCRAPLING_SOLVE_CLOUDFLARE': os.environ.get('SCRAPLING_SOLVE_CLOUDFLARE', '0'),
           'EXTERNAL_SEARCH_MONTHLY_LIMIT': os.environ.get('EXTERNAL_SEARCH_MONTHLY_LIMIT', '0'),
           'BRAVE_SEARCH_API_KEY': os.environ.get('BRAVE_SEARCH_API_KEY', ''),
           'CRAWLER_USER_AGENT': os.environ.get('CRAWLER_USER_AGENT', 'ChromeXEnrichment/4.0'),
@@ -165,6 +170,7 @@ rm -f "$BACKUP_SERVICE"
 echo "V4 installed: http://127.0.0.1:$APP_PORT/docs"
 echo "Configure API keys in $ENV_FILE, then restart chromex-enrichment-v4."
 echo 'Default search is local. Optional SearXNG setup: current/deploy/searxng/setup.sh'
+echo 'Optional Scrapling browser discovery: see current/SEARCH-OPTIONS.md'
 echo 'Calling integration must honor call_ready and run /call-check immediately before use.'
 exit 0
 __V4_PAYLOAD_BELOW__

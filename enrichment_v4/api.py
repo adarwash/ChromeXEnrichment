@@ -28,7 +28,8 @@ def create_app(service=None, api_key=None):
             if groups is not None and (not isinstance(groups, dict) or not all(isinstance(k, str) and isinstance(v, str) and v for k, v in groups.items())):
                 raise RuntimeError("SOURCE_GROUPS_JSON must map publisher domains to ownership groups")
             service = EnrichmentService(Fetcher(store, user_agent=os.getenv("CRAWLER_USER_AGENT", "ChromeXEnrichment/4.0"), search_spacing=float(os.getenv("SEARCH_SPACING_SECONDS", "1.1")), search_monthly_limit=int(os.getenv("EXTERNAL_SEARCH_MONTHLY_LIMIT", "0"))), store,
-                                        os.getenv("COMPANIES_HOUSE_API_KEY", ""), os.getenv("BRAVE_SEARCH_API_KEY", ""), groups, search_provider=os.getenv("SEARCH_PROVIDER", "local"), searxng_url=os.getenv("SEARXNG_URL", "http://127.0.0.1:8888"), searxng_daily_limit=int(os.getenv("SEARXNG_DAILY_LIMIT", "100")))
+                                        os.getenv("COMPANIES_HOUSE_API_KEY", ""), os.getenv("BRAVE_SEARCH_API_KEY", ""), groups, search_provider=os.getenv("SEARCH_PROVIDER", "local"), searxng_url=os.getenv("SEARXNG_URL", "http://127.0.0.1:8888"), searxng_daily_limit=int(os.getenv("SEARXNG_DAILY_LIMIT", "100")),
+                                        scrapling_options={"python": os.getenv("SCRAPLING_PYTHON", "/opt/chromex-enrichment-v4/scrapling/bin/python"), "engine": os.getenv("SCRAPLING_ENGINE", "bing"), "daily_limit": int(os.getenv("SCRAPLING_DAILY_LIMIT", "25")), "solve_cloudflare": os.getenv("SCRAPLING_SOLVE_CLOUDFLARE", "0") == "1"})
         service.store.prune()
         app.state.service = service
         yield

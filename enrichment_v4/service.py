@@ -17,10 +17,10 @@ MAX_AGE = 86400
 
 
 class EnrichmentService:
-    def __init__(self, fetcher, store, ch_key="", search_key="", source_groups=None, search_provider="local", searxng_url="http://127.0.0.1:8888", searxng_daily_limit=100):
+    def __init__(self, fetcher, store, ch_key="", search_key="", source_groups=None, search_provider="local", searxng_url="http://127.0.0.1:8888", searxng_daily_limit=100, scrapling_options=None):
         self.fetcher, self.store = fetcher, store
         self.ch = CompaniesHouse(fetcher, ch_key)
-        self.search = build_search(store, fetcher, search_provider, search_key, searxng_url, searxng_daily_limit)
+        self.search = build_search(store, fetcher, search_provider, search_key, searxng_url, searxng_daily_limit, scrapling_options)
         self.source_groups = dict(DEFAULT_SOURCE_GROUPS if source_groups is None else source_groups)
 
     def enrich(self, request: EnrichRequest):

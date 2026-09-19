@@ -1,6 +1,6 @@
-# Zero-budget search for ChromeX Enrichment V4.1
+# Zero-budget search for ChromeX Enrichment V4.2
 
-V4.1 runs without a paid search subscription. It can provide a SerpApi-style candidate-search endpoint for your own business catalogue and, optionally, a self-hosted SearXNG search companion. It does not create an index comparable to Google's for free. Searches find possible pages; the existing company/director/phone checks decide whether those pages support a calling record.
+V4.2 runs without a paid search subscription. It can provide a SerpApi-style candidate-search endpoint for your own business catalogue and, optionally, a self-hosted SearXNG search companion or a local Scrapling headless browser. It does not create an index comparable to Google's for free. Searches find possible pages; the existing company/director/phone checks decide whether those pages support a calling record.
 
 ## Recommended setup
 
@@ -86,7 +86,50 @@ Restart V4. Its adapter makes at most one SearXNG query every ten seconds and at
 
 Source: [SearXNG overview](https://docs.searxng.org/user/about.html), [JSON search API](https://docs.searxng.org/dev/search_api.html), [container setup](https://docs.searxng.org/admin/installation-docker.html), [engine selection](https://docs.searxng.org/admin/settings/settings.html), [upstream suspension](https://docs.searxng.org/admin/settings/settings_search.html). This companion uses free software; upstream availability is not guaranteed. It was not launched here because this environment has no Docker runtime.
 
-## Existing headless-browser/CAPTCHA option
+## Optional Scrapling browser discovery
+
+[Scrapling](https://github.com/D4Vinci/Scrapling) is free, BSD-3-Clause software. This integration pins Scrapling **0.4.15** and its Python dependencies in a separate environment. No paid search API, solver subscription or proxy account is required. The normal V4 install stays lightweight; installing this option downloads Chromium and its operating-system dependencies.
+
+On your Ubuntu server, from the extracted source or installed release:
+
+```bash
+cd /opt/chromex-enrichment-v4/current
+sudo bash deploy/scrapling/setup.sh
+```
+
+Then edit `/etc/chromex-enrichment-v4.env` and restart V4:
+
+```ini
+SEARCH_PROVIDER="scrapling"
+SCRAPLING_PYTHON="/opt/chromex-enrichment-v4/scrapling/bin/python"
+SCRAPLING_ENGINE="bing"
+SCRAPLING_DAILY_LIMIT="25"
+SCRAPLING_SOLVE_CLOUDFLARE="0"
+EXTERNAL_SEARCH_MONTHLY_LIMIT="0"
+```
+
+```bash
+sudo systemctl restart chromex-enrichment-v4
+```
+
+Set `SCRAPLING_ENGINE` to `google`, `bing` or `duckduckgo`. This is an operator setting; callers cannot choose engines or arbitrary browser URLs. Your existing `/discover-businesses` and enrichment requests use the new provider automatically. The local catalogue is still searched and remains usable during upstream failures. Switch `SEARCH_PROVIDER` back to `local` to disable browser discovery. No changes to the calling schema are required.
+
+The browser runs on your Linux machine using [StealthyFetcher](https://scrapling.readthedocs.io/en/latest/fetching/stealthy.html). Its optional `solve_cloudflare` handler is enabled only by `SCRAPLING_SOLVE_CLOUDFLARE="1"`. It is a Cloudflare-specific capability, **not a demonstrated Google reCAPTCHA solver or an IP-block guarantee**. The `google_search` library parameter merely sets a Referer; our adapter explicitly constructs the search URL and disables that parameter.
+
+Operational bounds:
+
+- One selected engine, one organic-results page per query; no automatic engine switching, next-page scraping or paid fallback.
+- One browser process per V4 worker, a 75-second total process deadline, at least 30 seconds between uncached attempts, and 25 attempts per UTC day by default. Busy/closely spaced work returns an explicit error for later retry. A query may load up to 80 browser subrequests; 25 queries does not mean 25 network requests.
+- A 24-hour candidate cache. Persisted budget and cooldown state survives restarts and is shared across engine choices. Unresolved challenges, consent redirects, unknown page layouts and browser failures open a one-hour cooldown; longer `Retry-After` values are honored.
+- Public DNS answers for a small fixed engine/asset host list are pinned into Chromium's resolver rules. Other hosts, unsafe schemes/ports, service workers, WebSockets and downloads are blocked. Business links are parsed but never visited by the search browser.
+- A fresh temporary profile and a minimal environment without API keys or inherited proxy configuration. Chromium's sandbox stays enabled; run V4 as its dedicated non-root user on a host supporting Chromium sandboxing. If the sandbox cannot start, the attempt fails; the adapter does not disable it.
+- Registry and business-source verification still use V4's separate DNS-pinned HTTP fetcher and robots policy. Search-engine browser requests use the fixed provider adapter and do not inherit that fetcher's robots rules; review the selected engine's access terms before enabling.
+
+Only recognised organic result links and titles are returned, marked `discovered_unverified`. Search snippets, adaptive selector guesses and CAPTCHA pages never establish directors or phone ownership. Browser discovery does not render blocked business websites for verification; insufficient source evidence still means `needs_review`.
+
+The Python dependency environment and offline adapter tests were checked here. The Chromium download timed out in this environment, so browser launch, live engine layouts and challenge success remain unvalidated. After installation on the target server, first try one known-business query, inspect source errors and check the returned company manually before increasing volume. No claim of 20,000 reliable free searches is made.
+
+## Existing V3 headless-browser/CAPTCHA option
 
 V3 already includes Crawl4AI, Playwright/Chromium and ScrapeGraphAI. The actual `fetch_html_with_crawl4ai()` helper starts a headless browser. Its configuration is plain `BrowserConfig(headless=True, verbose=False)` plus a page timeout; no explicit CAPTCHA-solving service or solver is configured in the repository examined.
 
@@ -110,4 +153,4 @@ No verified offer of 20,000 hosted web searches for $5 was found. Serper's start
 
 ## Validation boundary
 
-Offline tests exercise zero-provider-fee enrichment/discovery, authenticated CSV import, local search, budget enforcement, persistence/concurrency, SearXNG parsing/caching/cooldowns, no redirects, and the corrected V3 browser invocation. The full existing verification suite remains in place. These tests do not measure live Google/Bing/DDG challenge success, deploy the SearXNG container, or establish real business-contact accuracy. Those require testing on the target Linux host and checking a labelled business sample.
+Offline tests exercise zero-provider-fee enrichment/discovery, authenticated CSV import, local search, budget enforcement, persistence/concurrency, SearXNG parsing/caching/cooldowns, Scrapling result parsing and process/network guards, and the corrected V3 browser invocation. The full existing verification suite remains in place. These tests do not measure live Google/Bing/DDG challenge success, deploy the SearXNG container, or establish real business-contact accuracy. Those require testing on the target Linux host and checking a labelled business sample.

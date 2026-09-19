@@ -1,6 +1,6 @@
-# ChromeX Enrichment V4.1
+# ChromeX Enrichment V4.2
 
-**Zero-budget default:** local catalogue search and direct checks; paid search is opt-in with a zero-request default. [Search options, CSV import and SearXNG setup](SEARCH-OPTIONS.md).
+**Zero-budget default:** local catalogue search and direct checks; paid search is opt-in with a zero-request default. Optional Scrapling headless search supports Bing, Google or DuckDuckGo. [Search options, CSV import, Scrapling and SearXNG setup](SEARCH-OPTIONS.md).
 
 V4 adds a strict UK company/contact verification service and a self-contained Ubuntu installer. It is an intentionally conservative successor to V3's verification pipeline: incomplete or conflicting evidence produces `needs_review`, never a degraded calling record.
 
@@ -44,8 +44,8 @@ Configure `SOURCE_GROUPS_JSON` as a domain-to-ownership-group mapping after revi
 Requests use:
 
 - Companies House API, with at least one second between requests, below its published 600 requests per five minutes limit for this installation. A key used by other applications still needs a shared upstream quota plan.
-- Local SQLite catalogue search by default. Optional SearXNG offers self-hosted metasearch; optional Brave requires explicit selection and a positive persistent monthly HTTP-request allowance. Search snippets never become verified facts. See SEARCH-OPTIONS.md for source limits, costs and setup.
-- Website requests at least three seconds apart per registrable publisher, honoring longer robots delays/request rates. No browser impersonation, CAPTCHA solving, proxy rotation or block bypass.
+- Local SQLite catalogue search by default. Optional SearXNG offers self-hosted metasearch; optional Scrapling offers bounded browser discovery. Optional Brave requires explicit selection and a positive persistent monthly HTTP-request allowance. Search snippets never become verified facts. See SEARCH-OPTIONS.md for source limits, costs and setup.
+- Verification website requests at least three seconds apart per registrable publisher, honoring longer robots delays/request rates. Verification uses ordinary HTTP with no browser impersonation or CAPTCHA handling. The optional Scrapling browser is for search candidates only; blocked verification pages still produce review.
 - SQLite-backed cooldowns shared by threads and surviving restarts. HTTP 401/403/429 and challenge pages open a cooldown. `Retry-After` seconds/date values are honored; 429 is not immediately retried.
 - At most two retries for transient network/5xx failures, exponential delays and jitter, followed by a cooldown on exhausted server/network failures.
 - 200 website requests per publisher per UTC day, including robots requests; 5,000 API requests per provider per day. These are conservative ceilings, not guaranteed provider allowances. Four concurrent jobs, at most 18 website fetch attempts per company and a 180-second company request budget.
@@ -148,6 +148,6 @@ bash -n EnrichmentV4.sh
 bash EnrichmentV4.sh --extract /tmp/chromex-v4-review
 ```
 
-Regression coverage includes positive verified records; wrong/ambiguous company names; wrong website/phone; renamed and resigned people; corporate/nominee directors; duplicate names; officer pagination and partial failures; stale evidence; shared publishers and copied text; missing keys; rate limits; robots denial; private DNS; authentication; and a director resigning between enrichment and pre-call refresh. Tests use fixtures and mocked HTTP, not real registry credentials. Additional search tests cover the zero-budget default, candidate imports, SearXNG responses and hard HTTP-request caps. The root/systemd installation and real source coverage still need staging validation on the target Ubuntu host.
+Regression coverage includes positive verified records; wrong/ambiguous company names; wrong website/phone; renamed and resigned people; corporate/nominee directors; duplicate names; officer pagination and partial failures; stale evidence; shared publishers and copied text; missing keys; rate limits; robots denial; private DNS; authentication; and a director resigning between enrichment and pre-call refresh. Tests use fixtures and mocked HTTP, not real registry credentials. Additional search tests cover the zero-budget default, candidate imports, SearXNG responses, Scrapling parsing/process isolation/cooldowns and hard HTTP-request caps. The root/systemd installation and real source coverage still need staging validation on the target Ubuntu host.
 
 Before replacing the live queue, run V4 in shadow mode on a labelled sample of at least 100 businesses that includes known wrong-company, old-director, shared-office, trading-name, multi-site and changed-phone cases. Independently check legal entity, current director and business number. Record ready/review coverage, false approvals by field, source failures, request cost and latency. Investigate every false approval. Keep the conservative rules unless that evidence supports a reviewed change. This is how accuracy should be established; a high score from an AI model is not a measurement.
