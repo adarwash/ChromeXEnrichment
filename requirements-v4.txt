@@ -1,0 +1,6 @@
+# Runtime versions tested together. Python 3.12+.
+fastapi==0.141.1
+uvicorn==0.53.0
+beautifulsoup4==4.15.0
+phonenumbers==9.0.39
+tldextract==5.3.2
